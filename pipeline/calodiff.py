@@ -186,7 +186,6 @@ def train(
 
             for i, ax in enumerate(axs):
                 test_visualization_func(energy=generated_images[i].cpu(), ax=ax)
-                ax.set_title(f"y={y_test[i].item():.1f}")
             plt.show()
 
         # --- Опциональная фаза валидации ---
