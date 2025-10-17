@@ -173,15 +173,6 @@ def train(
         if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
             print("Visualizing examples from the test batch...")
             x_test_real, y_test = fixed_test_batch
-            
-            # Заглушка, если sample не определена
-            if 'sample' not in globals():
-                def sample(model, y, steps, device, shape):
-                    model.eval()
-                    with torch.no_grad():
-                        # Простая заглушка: возвращает случайный шум
-                        return torch.randn(len(y), *shape).to(device)
-            
             generated_images = sample(
                 model, y_test.to(device), n_inference_steps, device,
                 shape=(x_test_real.shape[1], x_test_real.shape[2], x_test_real.shape[3])
