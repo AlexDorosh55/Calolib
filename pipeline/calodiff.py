@@ -85,44 +85,56 @@ def sample(
 def train(
     model: torch.nn.Module,
     train_loader: DataLoader,
-    valid_loader: DataLoader,
     n_epochs: int,
     loss_fn: Callable,
     optimizer: torch.optim.Optimizer,
     device: str,
+    # --- Опциональные параметры ---
+    valid_loader: Optional[DataLoader] = None,
     # --- Параметры Scheduler'ов ---
     lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     noise_scheduler_name: str = "cosine",
     # --- Параметры валидации и сохранения ---
     validation_freq: int = 1,
     n_inference_steps: int = 1000,
-    metric_calculator: Optional[object] = None,
+    metric_calculator: Optional[object] = None, # Параметр оставлен для совместимости
     checkpoint_path: str = "./checkpoints",
     # --- Параметры для ранней остановки (Early Stopping) ---
     early_stopping_patience: Optional[int] = None,
-    # --- НОВЫЕ ПАРАМЕТРЫ ДЛЯ ВИЗУАЛИЗАЦИИ НА ТЕСТЕ ---
+    # --- ПАРАМЕТРЫ ДЛЯ ВИЗУАЛИЗАЦИИ НА ТЕСТЕ ---
     test_loader: Optional[DataLoader] = None,
     visualize_test_batch: bool = True,
     test_visualization_func: Optional[Callable] = None
 ) -> Dict[str, List[float]]:
     """
     Универсальная функция для обучения диффузионной модели.
+    Сохраняет лучшую модель на основе улучшения train_loss.
+    Валидация и ранняя остановка являются опциональными.
+    Визуализация на тестовом батче происходит на каждой эпохе.
     """
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
+
+    # Заглушка, если NOISE_SCHEDULERS не определен в этом скоупе
+    if 'NOISE_SCHEDULERS' not in globals():
+        NOISE_SCHEDULERS = {'cosine': lambda t, max_t: (1 - torch.cos(t * torch.pi / max_t)) / 2}
 
     noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
 
     history = {'train_loss': [], 'valid_loss': []}
+    
+    # --- Переменные для отслеживания лучших состояний ---
+    best_train_loss = float('inf')
     best_valid_loss = float('inf')
+    best_model_state_on_train = None # Состояние модели с лучшим train_loss
+    
     patience_counter = 0
-    best_model_state = None
 
     # Заранее фиксируем один батч из test_loader для консистентной визуализации
     fixed_test_batch = None
-    if test_loader:
+    if test_loader and visualize_test_batch:
         try:
             fixed_test_batch = next(iter(test_loader))
         except StopIteration:
@@ -132,13 +144,12 @@ def train(
         print(f"--- Epoch {epoch + 1}/{n_epochs} ---")
         
         # --- Фаза обучения ---
-        # (Код фазы обучения остается без изменений)
         model.train()
         epoch_train_loss = []
         for x, y in tqdm(train_loader, desc="Training"):
             x, y = x.to(device), y.to(device)
             t = torch.randint(0, n_inference_steps, (x.shape[0],), device=device)
-            noise_amount = noise_scheduler_fn(t, n_inference_steps).view(-1, 1, 1, 1)
+            noise_amount = noise_scheduler_fn(t.float(), n_inference_steps).view(-1, 1, 1, 1).to(device)
             noise = torch.randn_like(x)
             noisy_x = x * (1 - noise_amount) + noise * noise_amount
             pred = model(noisy_x, 0, y)
@@ -147,66 +158,88 @@ def train(
             loss.backward()
             optimizer.step()
             epoch_train_loss.append(loss.item())
+        
         avg_train_loss = sum(epoch_train_loss) / len(epoch_train_loss)
         history['train_loss'].append(avg_train_loss)
         print(f"Avg Train Loss: {avg_train_loss:.5f}")
 
-        # --- Фаза валидации ---
-        if (epoch + 1) % validation_freq == 0:
-            # (Код фазы валидации остается без изменений)
+        # --- Логика сохранения модели по train_loss ---
+        # Происходит на каждой эпохе, независимо от валидации
+        if avg_train_loss < best_train_loss:
+            best_train_loss = avg_train_loss
+            best_model_state_on_train = copy.deepcopy(model.state_dict())
+            torch.save(best_model_state_on_train, os.path.join(checkpoint_path, "best_model_on_train.pth"))
+            print(f"🚀 New best model saved with train loss: {best_train_loss:.5f}")
+
+        # --- Визуализация на тестовом батче ---
+        # Происходит на каждой эпохе, если параметры предоставлены
+        if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
+            print("Visualizing examples from the test batch...")
+            x_test_real, y_test = fixed_test_batch
+            
+            # Заглушка, если sample не определена
+            if 'sample' not in globals():
+                def sample(model, y, steps, device, shape):
+                    model.eval()
+                    with torch.no_grad():
+                        # Простая заглушка: возвращает случайный шум
+                        return torch.randn(len(y), *shape).to(device)
+            
+            generated_images = sample(
+                model, y_test.to(device), n_inference_steps, device,
+                shape=(x_test_real.shape[1], x_test_real.shape[2], x_test_real.shape[3])
+            )
+
+            n_samples_to_show = min(len(generated_images), 5)
+            fig, axs = plt.subplots(1, n_samples_to_show, figsize=(20, 4))
+            fig.suptitle(f"Test Batch Visualization at Epoch {epoch + 1}", fontsize=16)
+
+            if n_samples_to_show == 1: axs = [axs] 
+
+            for i, ax in enumerate(axs):
+                test_visualization_func(energy=generated_images[i].cpu(), ax=ax)
+                ax.set_title(f"y={y_test[i].item():.1f}")
+            plt.show()
+
+        # --- Опциональная фаза валидации ---
+        if valid_loader and (epoch + 1) % validation_freq == 0:
             model.eval()
             epoch_valid_loss = []
             with torch.no_grad():
                 for x_val, y_val in tqdm(valid_loader, desc="Validation"):
-                    x_val = x_val.to(device)
-                    # В отличие от старого кода, здесь мы предсказываем на реальных данных, 
-                    # чтобы валидационный лосс был более репрезентативным
-                    pred_val = model(x_val, 0, y_val.to(device))
-                    loss = loss_fn(x_val.cpu(), pred_val.cpu())
+                    x_val, y_val = x_val.to(device), y_val.to(device)
+                    pred_val = model(x_val, 0, y_val) # y_val уже на device
+                    loss = loss_fn(x_val, pred_val)
                     epoch_valid_loss.append(loss.item())
+            
             avg_valid_loss = sum(epoch_valid_loss) / len(epoch_valid_loss)
             history['valid_loss'].append(avg_valid_loss)
             print(f"Avg Validation Loss: {avg_valid_loss:.5f}")
             
-            # --- Логика сохранения и ранней остановки ---
-            # (Код остается без изменений)
             if lr_scheduler:
                 if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     lr_scheduler.step(avg_valid_loss)
                 else:
                     lr_scheduler.step()
+            
             if avg_valid_loss < best_valid_loss:
                 best_valid_loss = avg_valid_loss
                 patience_counter = 0
-                best_model_state = copy.deepcopy(model.state_dict())
-                torch.save(best_model_state, os.path.join(checkpoint_path, "best_model.pth"))
-                print(f"✨ New best model saved with validation loss: {best_valid_loss:.5f}")
+                # Можно дополнительно сохранять и лучшую по валидации модель, если нужно
+                # best_model_state_on_valid = copy.deepcopy(model.state_dict())
+                # torch.save(best_model_state_on_valid, os.path.join(checkpoint_path, "best_model_on_valid.pth"))
+                print(f"✨ Validation loss improved to: {best_valid_loss:.5f}")
             elif early_stopping_patience:
                 patience_counter += 1
                 if patience_counter >= early_stopping_patience:
-                    print("Stopping early.")
-                    model.load_state_dict(best_model_state)
+                    print(f"Stopping early. No improvement in validation loss for {patience_counter} epochs.")
+                    if best_model_state_on_train:
+                        model.load_state_dict(best_model_state_on_train)
                     return history
 
-            if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
-                print("Visualizing examples from the test batch...")
-                x_test_real, y_test = fixed_test_batch
-                
-                generated_images = sample(
-                    model, y_test, n_inference_steps, device,
-                    shape=(x_test_real.shape[1], x_test_real.shape[2], x_test_real.shape[3])
-                )
-
-                n_samples_to_show = min(len(generated_images), 5)
-                fig, axs = plt.subplots(1, n_samples_to_show, figsize=(20, 4))
-                fig.suptitle(f"Test Batch Visualization at Epoch {epoch + 1}", fontsize=16)
-
-                if n_samples_to_show == 1: axs = [axs] # Обработка случая с одним изображением
-
-                for i, ax in enumerate(axs):
-                    test_visualization_func(energy=generated_images[i].cpu(), ax=ax)
-                    ax.set_title(f"y={y_test[i].item():.1f}")
-                plt.show()
-
-    model.load_state_dict(best_model_state)
+    # В конце обучения загружаем в модель состояние с лучшим train_loss
+    print("Training finished. Loading the best model based on training loss.")
+    if best_model_state_on_train:
+        model.load_state_dict(best_model_state_on_train)
+        
     return history
