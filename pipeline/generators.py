@@ -6,8 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from pipeline import aux
-
 
 class Generator(nn.Module):
     @abstractmethod
