@@ -115,9 +115,6 @@ def train(
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
 
-    # Заглушка, если NOISE_SCHEDULERS не определен в этом скоупе
-    if 'NOISE_SCHEDULERS' not in globals():
-        NOISE_SCHEDULERS = {'cosine': lambda t, max_t: (1 - torch.cos(t * torch.pi / max_t)) / 2}
 
     noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
     if not noise_scheduler_fn:
