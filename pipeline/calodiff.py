@@ -111,23 +111,13 @@ class MixedConditionedUnet(nn.Module):
         # Обрезаем до [bs, 1, 30, 30] перед возвратом
         return output[:, :, 1:-1, 1:-1]
 
-# --- Вспомогательные функции (Scheduler'ы шума) ---
+# --- Scheduler'ы шума для обучения ---
 
 def _cosine_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
-    """
-    Косинусный scheduler для уровня шума.
-    Плавное изменение от 0 до 1.
-    """
     return 0.5 * (1 - torch.cos(torch.pi * t / t_max))
 
-
 def _linear_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
-    """
-    Линейный scheduler для уровня шума.
-    Изменение от 0 до 1.
-    """
     return t / t_max
-
 
 NOISE_SCHEDULERS = {
     "cosine": _cosine_noise_scheduler,
@@ -143,7 +133,7 @@ def sample(
         n_steps: int,
         device: str,
         shape: tuple = (1, 30, 30),
-        denoising_scheduler_name: str = "cosine"
+        sampling_method: str = "default"
 ) -> torch.Tensor:
     """
     Функция для генерации изображений (инференса) с использованием обученной модели.
@@ -152,18 +142,15 @@ def sample(
     x_gen = torch.rand(n_samples, *shape).to(device)
     y_conditions = y_conditions.to(device)
 
-    denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
-    if not denoising_scheduler:
-        raise ValueError(f"Неизвестный scheduler: {denoising_scheduler_name}")
-
     model.eval()
     with torch.no_grad():
-        for i in tqdm(range(n_steps), desc="Sampling", leave=False):
-            t_val = torch.tensor(i, device=device)
-            noise_amount = denoising_scheduler(t_val.float(), n_steps)
-            pred = model(x_gen, 0, y_conditions)
-            mix_factor = 1 / (n_steps - i) if n_steps - i != 0 else 1.0
-            x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
+        if sampling_method == "default":
+            for i in tqdm(range(n_steps), desc="Sampling", leave=False):
+                pred = model(x_gen, 0, y_conditions)
+                mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
+                x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
+        else:
+            raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
 
     return x_gen.cpu()
 
@@ -212,13 +199,13 @@ def train(
 
     for epoch in range(n_epochs):
         print(f"--- Epoch {epoch + 1}/{n_epochs} ---")
-        
+
         model.train()
         epoch_train_loss = []
         for x, y in tqdm(train_loader, desc="Training"):
             x, y = x.to(device), y.to(device)
             t = torch.randint(0, n_inference_steps, (x.shape[0],), device=device)
-            noise_amount = noise_scheduler_fn(t.float(), n_inference_steps).view(-1, 1, 1, 1).to(device)
+            noise_amount = noise_scheduler_fn(t.float(), n_inference_steps).view(-1, 1, 1, 1)
             noise = torch.randn_like(x)
             noisy_x = x * (1 - noise_amount) + noise * noise_amount
             pred = model(noisy_x, 0, y)
@@ -227,7 +214,7 @@ def train(
             loss.backward()
             optimizer.step()
             epoch_train_loss.append(loss.item())
-        
+
         avg_train_loss = sum(epoch_train_loss) / len(epoch_train_loss)
         history['train_loss'].append(avg_train_loss)
         print(f"Avg Train Loss: {avg_train_loss:.5f}")
@@ -239,17 +226,15 @@ def train(
             print(f"🚀 New best model saved with train loss: {best_train_loss:.5f}")
 
         if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
-            print("Visualizing examples from the test batch...")
             x_test_real, y_test = fixed_test_batch
             generated_images = sample(
                 model, y_test, n_inference_steps, device,
-                shape=(x_test_real.shape[1], x_test_real.shape[2], x_test_real.shape[3])
+                shape=x_test_real.shape[1:]
             )
-
             n_samples_to_show = min(len(generated_images), 5)
             fig, axs = plt.subplots(1, n_samples_to_show, figsize=(20, 4))
             fig.suptitle(f"Test Batch Visualization at Epoch {epoch + 1}", fontsize=16)
-            if n_samples_to_show == 1: axs = [axs] 
+            if n_samples_to_show == 1: axs = [axs]
             for i, ax in enumerate(axs):
                 test_visualization_func(energy=generated_images[i].cpu(), ax=ax)
             plt.show()
@@ -263,14 +248,14 @@ def train(
                     pred_val = model(x_val, 0, y_val)
                     loss = loss_fn(x_val, pred_val)
                     epoch_valid_loss.append(loss.item())
-            
+
             avg_valid_loss = sum(epoch_valid_loss) / len(epoch_valid_loss)
             history['valid_loss'].append(avg_valid_loss)
             print(f"Avg Validation Loss: {avg_valid_loss:.5f}")
-            
+
             if lr_scheduler:
                 lr_scheduler.step(avg_valid_loss) if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) else lr_scheduler.step()
-            
+
             if avg_valid_loss < best_valid_loss:
                 best_valid_loss = avg_valid_loss
                 patience_counter = 0
@@ -286,10 +271,15 @@ def train(
     print("Training finished. Loading the best model based on training loss.")
     if best_model_state_on_train:
         model.load_state_dict(best_model_state_on_train)
-        
+
     return history
 
-# --- Функция инференса с сохранением ---
+
+# ===================================================================
+# --- НОВЫЕ И ОБНОВЛЕННЫЕ ФУНКЦИИ ---
+# ===================================================================
+
+# --- 1. Функция инференса с сохранением ---
 
 def inference_with_saving(
     model: torch.nn.Module,
@@ -297,54 +287,46 @@ def inference_with_saving(
     n_steps: int,
     device: str,
     output_path: str = "generated_data.npz",
-    denoising_scheduler_name: str = "cosine"
+    sampling_method: str = "default"
 ):
     """
-    Проводит инференс на всем даталоадере, генерирует изображения и сохраняет
-    результаты в .npz файл.
+    Проводит инференс на всем даталоадере и сохраняет результаты в .npz файл.
     """
-    all_real_images = []
-    all_gen_images = []
-    all_conditions = []
-    
+    all_real_images, all_gen_images, all_conditions = [], [], []
     model.to(device)
     model.eval()
 
     for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
-        # Генерация изображений
         x_gen = sample(
-            model, y_cond, n_steps, device, 
-            shape=x_real.shape[1:], # (C, H, W)
-            denoising_scheduler_name=denoising_scheduler_name
+            model, y_cond, n_steps, device,
+            shape=x_real.shape[1:],
+            sampling_method=sampling_method
         )
-        
         all_real_images.append(x_real.cpu().numpy())
         all_gen_images.append(x_gen.cpu().numpy())
         all_conditions.append(y_cond.cpu().numpy())
 
-    # Объединение всех батчей в единые массивы
     real_images_np = np.vstack(all_real_images)
     gen_images_np = np.vstack(all_gen_images)
     conditions_np = np.vstack(all_conditions)
-    
-    # Создание меток: 1 для реальных, 0 для сгенерированных
+
     real_labels = np.ones(len(real_images_np))
     gen_labels = np.zeros(len(gen_images_np))
-    
-    # Объединяем реальные и сгенерированные данные
+
     final_images = np.vstack([real_images_np, gen_images_np])
     final_labels = np.hstack([real_labels, gen_labels])
-    final_conditions = np.vstack([conditions_np, conditions_np]) # Условия дублируются
+    final_conditions = np.vstack([conditions_np, conditions_np])
 
-    # Сохранение в сжатый NPZ файл
     np.savez_compressed(
-        output_path, 
-        images=final_images, 
-        labels=final_labels, 
+        output_path,
+        images=final_images,
+        labels=final_labels,
         conditions=final_conditions
     )
     print(f"✅ Данные успешно сохранены в файл: '{output_path}'")
 
+
+# --- 2. Функция оценки и визуализации физических метрик ---
 
 def _calculate_physics_metrics(
     gen_images: np.ndarray,
@@ -353,192 +335,118 @@ def _calculate_physics_metrics(
     num_clusters: int = 20
 ) -> Dict[str, np.ndarray]:
     """Вспомогательная функция для расчета физических метрик."""
-    
-    # Убираем канал, если он равен 1 (для calogan_metrics)
-    if gen_images.shape[1] == 1:
-        gen_images_sq = gen_images.reshape(-1, 30, 30)
-        real_images_sq = real_images.reshape(-1, 30, 30)
-    else: # Если каналов > 1, возможно, нужно другое преобразование
-        gen_images_sq = gen_images 
-        real_images_sq = real_images
+    gen_images_sq = gen_images.reshape(-1, 30, 30) if gen_images.shape[1] == 1 else gen_images
+    real_images_sq = real_images.reshape(-1, 30, 30) if real_images.shape[1] == 1 else real_images
 
-    # --- 4 Метрики асимметрии и ширины ---
     metrics = {
         "Gen Longitudual Asymmetry": calogan_metrics.get_assymetry(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Gen Transverse Asymmetry": calogan_metrics.get_assymetry(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
         "Gen Longitudual Width": calogan_metrics.get_shower_width(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Gen Transverse Width": calogan_metrics.get_shower_width(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
-        
         "Real Longitudual Asymmetry": calogan_metrics.get_assymetry(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Real Transverse Asymmetry": calogan_metrics.get_assymetry(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
         "Real Longitudual Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Real Transverse Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
     }
 
-    # --- PRD метрики ---
-    gen_physics_stats = np.stack([
-        metrics["Gen Longitudual Asymmetry"], metrics["Gen Transverse Asymmetry"],
-        metrics["Gen Longitudual Width"], metrics["Gen Transverse Width"]
-    ], axis=1)
+    gen_physics_stats = np.stack([metrics["Gen Longitudual Asymmetry"], metrics["Gen Transverse Asymmetry"], metrics["Gen Longitudual Width"], metrics["Gen Transverse Width"]], axis=1)
+    real_physics_stats = np.stack([metrics["Real Longitudual Asymmetry"], metrics["Real Transverse Asymmetry"], metrics["Real Longitudual Width"], metrics["Real Transverse Width"]], axis=1)
 
-    real_physics_stats = np.stack([
-        metrics["Real Longitudual Asymmetry"], metrics["Real Transverse Asymmetry"],
-        metrics["Real Longitudual Width"], metrics["Real Transverse Width"]
-    ], axis=1)
+    precision_energy, recall_energy = calc_pr_rec_from_embeds(gen_images.reshape(gen_images.shape[0], -1), real_images.reshape(real_images.shape[0], -1), num_clusters=num_clusters)
+    precision_physics, recall_physics = calc_pr_rec_from_embeds(gen_physics_stats, real_physics_stats, num_clusters=num_clusters)
 
-    precision_energy, recall_energy = calc_pr_rec_from_embeds(
-        gen_images.reshape(gen_images.shape[0], -1),
-        real_images.reshape(real_images.shape[0], -1),
-        num_clusters=num_clusters
-    )
-    precision_physics, recall_physics = calc_pr_rec_from_embeds(
-        gen_physics_stats, real_physics_stats, num_clusters=num_clusters
-    )
-    
     metrics.update({
         'PRD_energy_AUC': np.trapz(precision_energy, recall_energy),
-        'precision_energy': precision_energy,
-        'recall_energy': recall_energy,
+        'precision_energy': precision_energy, 'recall_energy': recall_energy,
         'PRD_physics_AUC': np.trapz(precision_physics, recall_physics),
-        'precision_physics': precision_physics,
-        'recall_physics': recall_physics
+        'precision_physics': precision_physics, 'recall_physics': recall_physics
     })
-    
     return metrics
-
 
 def evaluate_and_visualize_physics_metrics(
     gen_images: torch.Tensor,
     real_images: torch.Tensor,
     conditions: torch.Tensor,
     num_clusters: int = 20,
-    statistics_to_plot: List[str] = [
-        'Longitudual Asymmetry', 'Transverse Asymmetry',
-        'Longitudual Width', 'Transverse Width'
-    ]
+    statistics_to_plot: List[str] = ['Longitudual Asymmetry', 'Transverse Asymmetry', 'Longitudual Width', 'Transverse Width']
 ):
     """
     Вычисляет и визуализирует физические метрики для сгенерированных и реальных изображений.
     """
-    # Перевод данных в numpy
-    gen_images_np = gen_images.detach().cpu().numpy()
-    real_images_np = real_images.detach().cpu().numpy()
-    conditions_np = conditions.detach().cpu().numpy()
-    
-    scores = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np, num_clusters)
-    
-    print("--- Результаты Физических Метрик ---")
-    print(f"PRD Energy AUC: {scores['PRD_energy_AUC']:.4f}")
-    print(f"PRD Physics AUC: {scores['PRD_physics_AUC']:.4f}")
-    print("------------------------------------")
+    scores = _calculate_physics_metrics(
+        gen_images.cpu().numpy(), real_images.cpu().numpy(), conditions.cpu().numpy(), num_clusters
+    )
 
-    sns.set(style="whitegrid")
+    print(f"--- Результаты Физических Метрик ---\nPRD Energy AUC: {scores['PRD_energy_AUC']:.4f}\nPRD Physics AUC: {scores['PRD_physics_AUC']:.4f}\n------------------------------------")
+    sns.set_theme(style="whitegrid")
 
-    # Визуализация гистограмм
     for statistic in statistics_to_plot:
-        gen_data = scores['Gen ' + statistic]
-        true_data = scores['Real ' + statistic]
-        
-        min_val = min(gen_data.min(), true_data.min())
-        max_val = max(gen_data.max(), true_data.max())
-        
-        bins = np.linspace(min_val, max_val, 50)
-        
         plt.figure(figsize=(10, 6))
-        sns.histplot(gen_data, bins=bins, alpha=0.6, label="Generated", color="orange", kde=True)
-        sns.histplot(true_data, bins=bins, alpha=0.6, label="Real", color="blue", kde=True)
-        
-        plt.xlabel("Value", fontsize=12)
-        plt.ylabel("Count", fontsize=12)
+        sns.histplot(scores['Gen ' + statistic], bins=50, alpha=0.6, label="Generated", color="orange", kde=True)
+        sns.histplot(scores['Real ' + statistic], bins=50, alpha=0.6, label="Real", color="blue", kde=True)
         plt.title(f"Distribution of {statistic}", fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
+        plt.legend()
         plt.tight_layout()
         plt.show()
 
-    # Визуализация PRD кривых
     print('Energy PRD Curve')
-    fig_energy = plot_pr_aucs(scores['precision_energy'], scores['recall_energy'])
+    plot_pr_aucs(scores['precision_energy'], scores['recall_energy'])
     plt.show()
 
     print('Physics PRD Curve')
-    fig_physics = plot_pr_aucs(scores['precision_physics'], scores['recall_physics'])
+    plot_pr_aucs(scores['precision_physics'], scores['recall_physics'])
     plt.show()
-    
     return scores
 
 
-# --- Функция оценки метрик на каждом шаге Denoising'а ---
+# --- 3. Функция оценки метрик на каждом шаге Denoising'а ---
 
 def evaluate_metrics_over_denoising_steps(
     model: torch.nn.Module,
     dataloader: DataLoader,
     n_steps: int,
     device: str,
-    denoising_scheduler_name: str = "cosine"
+    sampling_method: str = "default"
 ) -> Dict[str, List[float]]:
     """
-    Оценивает изменение физических метрик на каждом шаге процесса denoising.
-    Использует один батч из даталоадера для оценки.
+    Оценивает изменение физических метрик на каждом шаге процесса denoising,
+    используя один батч из даталоадера.
     """
     model.to(device)
     model.eval()
 
-    # Берем один батч для анализа
     try:
         x_real, y_conditions = next(iter(dataloader))
     except StopIteration:
-        print("Ошибка: dataloader пуст. Невозможно провести оценку.")
+        print("Ошибка: dataloader пуст.")
         return {}
 
-    x_real = x_real.to(device)
-    y_conditions = y_conditions.to(device)
-    
-    n_samples = y_conditions.shape[0]
-    shape = x_real.shape[1:]
-    
-    # Начинаем с чистого шума
-    x_gen = torch.rand(n_samples, *shape).to(device)
+    x_real, y_conditions = x_real.to(device), y_conditions.to(device)
+    x_gen = torch.rand_like(x_real)
 
-    denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
-    if not denoising_scheduler:
-        raise ValueError(f"Неизвестный scheduler: {denoising_scheduler_name}")
-        
-    metrics_history = {
-        'step': [],
-        'PRD_energy_AUC': [],
-        'PRD_physics_AUC': []
-    }
+    metrics_history = {'step': [], 'PRD_energy_AUC': [], 'PRD_physics_AUC': []}
 
     with torch.no_grad():
-        for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            # Один шаг генерации
-            pred = model(x_gen, 0, y_conditions)
-            mix_factor = 1 / (n_steps - i) if n_steps - i != 0 else 1.0
-            x_gen_step = x_gen * (1 - mix_factor) + pred * mix_factor
+        if sampling_method == "default":
+            for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
+                pred = model(x_gen, 0, y_conditions)
+                mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
+                x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
 
-            # Оцениваем метрики на текущем шаге
-            # Переводим в numpy для _calculate_physics_metrics
-            gen_images_np = x_gen_step.cpu().numpy()
-            real_images_np = x_real.cpu().numpy()
-            conditions_np = y_conditions.cpu().numpy()
-            
-            # Считаем только ключевые метрики для скорости
-            current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
-            
-            # Сохраняем историю
-            metrics_history['step'].append(i)
-            metrics_history['PRD_energy_AUC'].append(current_metrics['PRD_energy_AUC'])
-            metrics_history['PRD_physics_AUC'].append(current_metrics['PRD_physics_AUC'])
-
-            # Обновляем x_gen для следующего шага
-            x_gen = x_gen_step
+                current_metrics = _calculate_physics_metrics(
+                    x_gen.cpu().numpy(), x_real.cpu().numpy(), y_conditions.cpu().numpy()
+                )
+                metrics_history['step'].append(i)
+                metrics_history['PRD_energy_AUC'].append(current_metrics['PRD_energy_AUC'])
+                metrics_history['PRD_physics_AUC'].append(current_metrics['PRD_physics_AUC'])
+        else:
+            raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
 
     print("✅ Анализ по шагам завершен.")
-    
-    # Визуализация результатов
+
     plt.figure(figsize=(12, 6))
-    plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
-    plt.plot(metrics_history['step'], metrics_history['PRD_physics_AUC'], label='PRD Physics AUC', marker='.')
+    plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.', linestyle='-')
+    plt.plot(metrics_history['step'], metrics_history['PRD_physics_AUC'], label='PRD Physics AUC', marker='.', linestyle='-')
     plt.xlabel("Denoising Step")
     plt.ylabel("AUC Value")
     plt.title("Изменение PRD AUC в процессе Denoising'а")
