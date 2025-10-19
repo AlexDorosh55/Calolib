@@ -406,79 +406,76 @@ def evaluate_metrics_over_denoising_steps(
     dataloader: DataLoader,
     n_steps: int,
     device: str,
-    sampling_method: str = "default"
+    denoising_scheduler_name: str = "cosine"
 ) -> Dict[str, List[float]]:
     """
-    Оценивает изменение физических метрик на каждом шаге процесса denoising,
-    используя один батч из даталоадера. Строит сглаженный график с областями
-    стандартного отклонения.
+    Оценивает изменение физических метрик на каждом шаге процесса denoising.
+    Использует один батч из даталоадера для оценки.
     """
     model.to(device)
     model.eval()
 
+    # Берем один батч для анализа
     try:
         x_real, y_conditions = next(iter(dataloader))
     except StopIteration:
-        print("Ошибка: dataloader пуст.")
+        print("Ошибка: dataloader пуст. Невозможно провести оценку.")
         return {}
 
-    x_real, y_conditions = x_real.to(device), y_conditions.to(device)
-    x_gen = torch.rand_like(x_real)
+    x_real = x_real.to(device)
+    y_conditions = y_conditions.to(device)
+    
+    n_samples = y_conditions.shape[0]
+    shape = x_real.shape[1:]
+    
+    # Начинаем с чистого шума
+    x_gen = torch.rand(n_samples, *shape).to(device)
 
-    # Словари для хранения статистики на каждом шаге
+    denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
+    if not denoising_scheduler:
+        raise ValueError(f"Неизвестный scheduler: {denoising_scheduler_name}")
+        
     metrics_history = {
         'step': [],
-        'energy_auc_mean': [], 'energy_auc_std': [],
-        'physics_auc_mean': [], 'physics_auc_std': []
+        'PRD_energy_AUC': [],
+        'PRD_physics_AUC': []
     }
 
     with torch.no_grad():
-        if sampling_method == "default":
-            for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-                pred = model(x_gen, 0, y_conditions)
-                mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
-                x_gen =  pred * 1.0
+        for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
+            # Один шаг генерации
+            pred = model(x_gen, 0, y_conditions)
+            mix_factor = 1 / (n_steps - i) if n_steps - i != 0 else 1.0
+            x_gen_step = pred
 
-                current_metrics = _calculate_physics_metrics(
-                    x_gen.cpu().numpy(), x_real.cpu().numpy(), y_conditions.cpu().numpy()
-                )
-                
-                energy_auc = current_metrics['PRD_energy_AUC']
-                physics_auc = current_metrics['PRD_physics_AUC']
+            # Оцениваем метрики на текущем шаге
+            # Переводим в numpy для _calculate_physics_metrics
+            gen_images_np = x_gen_step.cpu().numpy()
+            real_images_np = x_real.cpu().numpy()
+            conditions_np = y_conditions.cpu().numpy()
+            
+            # Считаем только ключевые метрики для скорости
+            current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
+            
+            # Сохраняем историю
+            metrics_history['step'].append(i)
+            metrics_history['PRD_energy_AUC'].append(current_metrics['PRD_energy_AUC'])
+            metrics_history['PRD_physics_AUC'].append(current_metrics['PRD_physics_AUC'])
 
-                metrics_history['step'].append(i)
-                metrics_history['energy_auc_mean'].append(np.mean(energy_auc))
-                metrics_history['energy_auc_std'].append(np.std(energy_auc))
-                metrics_history['physics_auc_mean'].append(np.mean(physics_auc))
-                metrics_history['physics_auc_std'].append(np.std(physics_auc))
-        else:
-            raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
+            # Обновляем x_gen для следующего шага
+            x_gen = x_gen_step
 
     print("✅ Анализ по шагам завершен.")
-
-    # --- ✨ УЛУЧШЕННАЯ ВИЗУАЛИЗАЦИЯ ---
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(14, 7))
-
-    # Извлекаем данные для удобства
-    steps = np.array(metrics_history['step'])
-    e_mean = np.array(metrics_history['energy_auc_mean'])
-    e_std = np.array(metrics_history['energy_auc_std'])
-    p_mean = np.array(metrics_history['physics_auc_mean'])
-    p_std = np.array(metrics_history['physics_auc_std'])
-
-    # Плот для Energy AUC
-    ax.plot(steps, e_mean, label='PRD Energy AUC (Mean)', color='royalblue', linewidth=2)
-    ax.fill_between(steps, e_mean - e_std, e_mean + e_std, color='royalblue', alpha=0.2, label='Std. Dev.')
-
-    # Плот для Physics AUC
-    ax.plot(steps, p_mean, label='PRD Physics AUC (Mean)', color='darkorange', linewidth=2)
-    ax.fill_between(steps, p_mean - p_std, p_mean + p_std, color='darkorange', alpha=0.2)
-
-    ax.set_xlabel("Denoising Step", fontsize=12)
-    ax.set_ylabel("AUC Value", fontsize=12)
-    ax.set_title("Изменение PRD AUC в процессе Denoising'а", fontsize=16)
-    ax.legend()
+    
+    # Визуализация результатов
+    plt.figure(figsize=(12, 6))
+    plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
+    plt.plot(metrics_history['step'], metrics_history['PRD_physics_AUC'], label='PRD Physics AUC', marker='.')
+    plt.xlabel("Denoising Step")
+    plt.ylabel("AUC Value")
+    plt.title("Изменение PRD AUC в процессе Denoising'а")
+    plt.legend()
+    plt.grid(True)
     plt.show()
 
     return metrics_history
