@@ -1,6 +1,7 @@
 # calodiff.py
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -14,6 +15,101 @@ from pipeline.custom_metrics import *
 from pipeline.physical_metrics.calogan_prd import get_energy_embedding, calc_pr_rec_from_embeds, plot_pr_aucs
 from pipeline.physical_metrics import calogan_metrics
 from pipeline.physical_metrics.prd_score import compute_prd_from_embedding, prd_to_max_f_beta_pair
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, C, H, W = x.shape
+        # Compute query, key, value projections
+        q = self.query(x).view(batch_size, -1, H*W).permute(0, 2, 1)  # (B, H*W, C//8)
+        k = self.key(x).view(batch_size, -1, H*W)  # (B, C//8, H*W)
+        v = self.value(x).view(batch_size, -1, H*W)  # (B, C, H*W)
+        
+        # Compute attention map
+        attention = torch.bmm(q, k)  # (B, H*W, H*W)
+        attention = nn.functional.softmax(attention, dim=-1)
+        
+        # Apply attention to value and combine with residual
+        out = torch.bmm(v, attention.permute(0, 2, 1))  # (B, C, H*W)
+        out = out.view(batch_size, C, H, W)
+        return self.gamma * out + x
+        
+class MixedConditionedUnet(nn.Module):
+    def __init__(self, image_size=30, cond_emb_size=9):
+        super().__init__()
+
+        self.image_size = image_size  # Размер входного изображения (30x30)
+        self.cond_emb_size = cond_emb_size  # Количество параметров условия
+
+        # Преобразуем вектор условий [bs, 9] в тензор [bs, 128, 2, 2]
+        self.fc1 = nn.Linear(cond_emb_size, 128 * 2 * 2)
+
+        # Транспонированные сверточные слои, как в CaloganPhysicsGenerator
+        self.conv1 = nn.ConvTranspose2d(128, 128, 3, stride=2, padding=1, output_padding=1)
+        self.conv2 = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1)
+        self.conv3 = nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1)
+        self.conv4 = nn.ConvTranspose2d(32, 1, 3, stride=2, padding=1, output_padding=1)
+
+        self.bn1 = nn.BatchNorm2d(128)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(32)
+
+        self.attn2 = SelfAttention(64)
+        self.attn3 = SelfAttention(32)
+
+        # UNet принимает изображение + доп. каналы
+        self.model = UNet2DModel(
+            sample_size=image_size + 2,  # Учитываем паддинг
+            in_channels=2,  # 1 канал для изображения + 1 канал для условий
+            out_channels=1,
+            layers_per_block=2,
+            block_out_channels=(32, 64, 128),
+            down_block_types=("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"),
+            up_block_types=("AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"),
+        )
+
+    def forward(self, x, t, condition):
+        """
+        x         : входное изображение [bs, 1, 30, 30]
+        t         : временной шаг (для диффузии)
+        condition : вектор условий [bs, 9]
+        """
+        bs, ch, w, h = x.shape
+        # Добавляем паддинг, чтобы получить размер 32x32
+        x = torch.nn.functional.pad(x, (1, 1, 1, 1))  # [bs, 1, 32, 32]
+
+        # Кодируем вектор условий в тензор [bs, 128, 2, 2]
+        condition_emb = nn.functional.relu(self.fc1(condition)).view(bs, 128, 2, 2)
+
+        # Прогоняем через транспонированные сверточные слои
+        EnergyDeposit = nn.functional.relu(self.bn1(self.conv1(condition_emb)))
+        EnergyDeposit = nn.functional.relu(self.bn2(self.conv2(EnergyDeposit)))
+        EnergyDeposit = self.attn2(EnergyDeposit)
+        EnergyDeposit = nn.functional.relu(self.bn3(self.conv3(EnergyDeposit)))
+        EnergyDeposit = self.attn3(EnergyDeposit)
+        EnergyDeposit = nn.functional.relu(self.conv4(EnergyDeposit))
+
+        # Обрезаем до [bs, 1, 30, 30]
+        EnergyDeposit = EnergyDeposit[:, :, 1:31, 1:31]
+
+        # Добавляем паддинг, чтобы получить размер 32x32
+        EnergyDeposit = torch.nn.functional.pad(EnergyDeposit, (1, 1, 1, 1))  # [bs, 1, 32, 32]
+
+        # Объединяем изображение и условие по каналу
+        net_input = torch.cat((x, EnergyDeposit), 1)  # [bs, 2, 32, 32]
+
+        # Прогоняем через UNet
+        output = x - self.model(net_input, t).sample  # [bs, 1, 32, 32]
+
+        # Обрезаем до [bs, 1, 30, 30] перед возвратом
+        return output[:, :, 1:-1, 1:-1]
 
 # --- Вспомогательные функции (Scheduler'ы шума) ---
 
