@@ -377,7 +377,7 @@ def evaluate_and_visualize_physics_metrics(
         gen_images.cpu().numpy(), real_images.cpu().numpy(), conditions.cpu().numpy(), num_clusters
     )
 
-    print(f"--- Результаты Физических Метрик ---\nPRD Energy AUC: {scores['PRD_energy_AUC'].item():.4f}\nPRD Physics AUC: {scores['PRD_physics_AUC'].item():.4f}\n------------------------------------")
+    print(f"--- Результаты Физических Метрик ---\nPRD Energy AUC: {np.mean(scores['PRD_energy_AUC']):.4f}\nPRD Physics AUC: {np.mean(scores['PRD_physics_AUC']):.4f}\n------------------------------------")
     sns.set_theme(style="whitegrid")
 
     for statistic in statistics_to_plot:
