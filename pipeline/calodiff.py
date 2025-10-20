@@ -433,25 +433,33 @@ def evaluate_metrics_over_denoising_steps(
 ) -> Dict[str, List[float]]:
     """
     Оценивает изменение физических метрик на каждом шаге процесса denoising.
-    Использует один батч из даталоадера для оценки.
+    Использует ВЕСЬ даталоадер для оценки, обрабатывая все изображения одновременно.
     """
     model.to(device)
     model.eval()
 
-    # Берем один батч для анализа
-    try:
-        x_real, y_conditions = next(iter(dataloader))
-    except StopIteration:
+    # Шаг 1: Собрать все данные из dataloader
+    all_x_real = []
+    all_y_conditions = []
+    print("Собираем данные из всего даталоадера...")
+    for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data"):
+        all_x_real.append(x_real_batch)
+        all_y_conditions.append(y_conditions_batch)
+
+    if not all_x_real:
         print("Ошибка: dataloader пуст. Невозможно провести оценку.")
         return {}
 
-    x_real = x_real.to(device)
-    y_conditions = y_conditions.to(device)
+    # Шаг 2: Объединить все батчи в единые тензоры
+    x_real = torch.cat(all_x_real, dim=0).to(device)
+    y_conditions = torch.cat(all_y_conditions, dim=0).to(device)
     
     n_samples = y_conditions.shape[0]
     shape = x_real.shape[1:]
     
-    # Начинаем с чистого шума
+    print(f"Оценка будет проводиться на {n_samples} семплах.")
+
+    # Шаг 3: Начать с чистого шума для всего набора данных
     x_gen = torch.rand(n_samples, *shape).to(device)
 
     denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
@@ -468,12 +476,14 @@ def evaluate_metrics_over_denoising_steps(
 
     with torch.no_grad():
         for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            # Один шаг генерации
+            # Шаг 4: Один шаг генерации для ВСЕХ изображений
             pred = model(x_gen, 0, y_conditions)
-            mix_factor = 1 / (n_steps - i) if n_steps - i != 0 else 1.0
+            # Логика смешивания или шага шедулера должна быть здесь,
+            # если она более сложная, чем просто присваивание.
+            # Для простоты примера, используем предсказание модели.
             x_gen_step = pred
 
-            # Оцениваем метрики на текущем шаге
+            # Шаг 5: Оценить метрики на текущем шаге для ВСЕХ изображений
             # Переводим в numpy для _calculate_physics_metrics
             gen_images_np = x_gen_step.cpu().numpy()
             real_images_np = torch.expm1(x_real).cpu().numpy()
@@ -496,13 +506,26 @@ def evaluate_metrics_over_denoising_steps(
             x_gen = x_gen_step
 
     print("Анализ по шагам завершен.")
+    
     # Визуализация результатов
     plt.figure(figsize=(12, 6))
     plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
+    plt.fill_between(
+        metrics_history['step'],
+        [m - s for m, s in zip(metrics_history['PRD_energy_AUC'], metrics_history['PRD_energy_AUC_std'])],
+        [m + s for m, s in zip(metrics_history['PRD_energy_AUC'], metrics_history['PRD_energy_AUC_std'])],
+        alpha=0.2
+    )
     plt.plot(metrics_history['step'], metrics_history['PRD_physics_AUC'], label='PRD Physics AUC', marker='.')
+    plt.fill_between(
+        metrics_history['step'],
+        [m - s for m, s in zip(metrics_history['PRD_physics_AUC'], metrics_history['PRD_physics_AUC_std'])],
+        [m + s for m, s in zip(metrics_history['PRD_physics_AUC'], metrics_history['PRD_physics_AUC_std'])],
+        alpha=0.2
+    )
     plt.xlabel("Denoising Step")
     plt.ylabel("AUC Value")
-    plt.title("Изменение PRD AUC в процессе Denoising'а")
+    plt.title("Изменение PRD AUC в процессе Denoising'а (на всем датасете)")
     plt.legend()
     plt.grid(True)
     plt.show()
