@@ -422,7 +422,7 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
         pr_aucs.append(auc(precisions[i], recalls[i]))
     std_pr_aucs = np.std(pr_aucs, axis=0)
 
-    return pr_aucs, std_pr_aucs
+    return np.mean(pr_aucs), std_pr_aucs
 
 def evaluate_metrics_over_denoising_steps(
     model: torch.nn.Module,
@@ -496,7 +496,6 @@ def evaluate_metrics_over_denoising_steps(
             x_gen = x_gen_step
 
     print("Анализ по шагам завершен.")
-    
     # Визуализация результатов
     plt.figure(figsize=(12, 6))
     plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
