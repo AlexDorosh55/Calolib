@@ -428,14 +428,15 @@ def evaluate_metrics_over_denoising_steps(
 ) -> Dict[str, List[float]]:
     """
     Оценивает изменение физических метрик на каждом шаге процесса denoising.
-    Использует ВЕСЬ даталоадер для оценки, обрабатывая все изображения одновременно.
+    Обрабатывает данные по батчам, чтобы избежать переполнения памяти GPU.
     """
     model.to(device)
     model.eval()
     
+    # Шаг 1: Загружаем все данные, но пока держим их на CPU
     all_x_real = []
     all_y_conditions = []
-    for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data"):
+    for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data to CPU"):
         all_x_real.append(x_real_batch)
         all_y_conditions.append(y_conditions_batch)
 
@@ -443,18 +444,19 @@ def evaluate_metrics_over_denoising_steps(
         print("Ошибка: dataloader пуст. Невозможно провести оценку.")
         return {}
 
-    # Шаг 2: Объединить все батчи в единые тензоры
-    x_real = torch.cat(all_x_real, dim=0).to(device)
-    y_conditions = torch.cat(all_y_conditions, dim=0).to(device)
+    # Объединяем все батчи в единые тензоры на CPU
+    x_real_cpu = torch.cat(all_x_real, dim=0)
+    y_conditions_cpu = torch.cat(all_y_conditions, dim=0)
     
-    n_samples = y_conditions.shape[0]
-    shape = x_real.shape[1:]
-    x_gen = torch.rand(n_samples, *shape).to(device)
+    n_samples = y_conditions_cpu.shape[0]
+    shape = x_real_cpu.shape[1:]
+    
+    # Генерируем начальный шум тоже на CPU
+    x_gen_cpu = torch.rand(n_samples, *shape)
+    
+    # Используем batch_size из оригинального dataloader'а
+    batch_size = dataloader.batch_size
 
-    denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
-    if not denoising_scheduler:
-        raise ValueError(f"Неизвестный scheduler: {denoising_scheduler_name}")
-        
     metrics_history = {
         'step': [],
         'PRD_energy_AUC': [],
@@ -465,11 +467,34 @@ def evaluate_metrics_over_denoising_steps(
 
     with torch.no_grad():
         for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            pred = model(x_gen, 0, y_conditions)
-            x_gen_step = pred
-            gen_images_np = x_gen_step.cpu().numpy()
-            real_images_np = x_real.cpu().numpy()
-            conditions_np = y_conditions.cpu().numpy()
+            # Список для сбора результатов обработки батчей на текущем шаге
+            generated_batches_for_step = []
+
+            # Итерируемся по данным батчами, чтобы прогнать через модель
+            for j in range(0, n_samples, batch_size):
+                # Вырезаем текущий батч
+                x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
+                y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
+
+                # Вызов модели только для одного батча!
+                pred_batch = model(x_gen_batch, 0, y_conditions_batch)
+
+                # Возвращаем результат на CPU и добавляем в список
+                generated_batches_for_step.append(pred_batch.cpu())
+
+                # Очистка памяти GPU (опционально, но помогает)
+                del x_gen_batch, y_conditions_batch, pred_batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Собираем результаты всех батчей в один тензор на CPU
+            x_gen_cpu = torch.cat(generated_batches_for_step, dim=0)
+
+            # Дальнейшие вычисления метрик, как и раньше
+            gen_images_np = x_gen_cpu.numpy()
+            real_images_np = x_real_cpu.numpy()
+            conditions_np = y_conditions_cpu.numpy()
+
             current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
             metrics_history['step'].append(i)
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
@@ -479,7 +504,6 @@ def evaluate_metrics_over_denoising_steps(
             metrics_history['PRD_physics_AUC'].append(current_prd_auc_physics)
             metrics_history['PRD_energy_AUC_std'].append(current_prd_auc_energy_std)
             metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
-            x_gen = x_gen_step
 
     print("Анализ по шагам завершен.")
     
