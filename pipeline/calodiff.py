@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 import os
 import copy
 import numpy as np
+from sklearn.metrics import auc
 from typing import Callable, Optional, Dict, List, Tuple
 from pipeline.metrics import *
 from pipeline.custom_metrics import *
@@ -401,6 +402,28 @@ def evaluate_and_visualize_physics_metrics(
 
 # --- 3. Функция оценки метрик на каждом шаге Denoising'а ---
 
+def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]):
+    """
+    Вычисляет PR-AUC для каждой кривой и стандартное отклонение точности
+    по всем кривым. Не строит графики.
+
+    Аргументы:
+        precisions (List[np.ndarray]): Список массивов значений точности.
+        recalls (List[np.ndarray]): Список массивов значений полноты.
+
+    Возвращает:
+        tuple: (pr_aucs, std_precisions)
+            pr_aucs (List[float]): Список всех индивидуальных PR-AUC.
+            std_precisions (np.ndarray): Стандартное отклонение точности (поэлементное).
+    """
+
+    pr_aucs = []
+    for i in range(len(recalls)):
+        pr_aucs.append(auc(recisions[i], recalls[i]))
+    std_pr_aucs = np.std(pr_aucs, axis=0)
+
+    return pr_aucs, std_pr_aucs
+
 def evaluate_metrics_over_denoising_steps(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -438,7 +461,9 @@ def evaluate_metrics_over_denoising_steps(
     metrics_history = {
         'step': [],
         'PRD_energy_AUC': [],
-        'PRD_physics_AUC': []
+        'PRD_physics_AUC': [],
+        'PRD_energy_AUC_std': [],
+        'PRD_physics_AUC_std': []
     }
 
     with torch.no_grad():
@@ -459,13 +484,18 @@ def evaluate_metrics_over_denoising_steps(
             
             # Сохраняем историю
             metrics_history['step'].append(i)
-            metrics_history['PRD_energy_AUC'].append(current_metrics['PRD_energy_AUC'])
-            metrics_history['PRD_physics_AUC'].append(current_metrics['PRD_physics_AUC'])
+            current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
+            current_prd_auc_physics, current_prd_auc_physics_std = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
+            
+            metrics_history['PRD_energy_AUC'].append(current_prd_auc_energy)
+            metrics_history['PRD_physics_AUC'].append(current_prd_auc_physics)
+            metrics_history['PRD_energy_AUC_std'].append(current_prd_auc_energy_std)
+            metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
 
             # Обновляем x_gen для следующего шага
             x_gen = x_gen_step
 
-    print("✅ Анализ по шагам завершен.")
+    print("Анализ по шагам завершен.")
     
     # Визуализация результатов
     plt.figure(figsize=(12, 6))
