@@ -275,11 +275,6 @@ def train(
 
     return history
 
-
-# ===================================================================
-# --- НОВЫЕ И ОБНОВЛЕННЫЕ ФУНКЦИИ ---
-# ===================================================================
-
 # --- 1. Функция инференса с сохранением ---
 
 def inference_with_saving(
@@ -324,7 +319,7 @@ def inference_with_saving(
         labels=final_labels,
         conditions=final_conditions
     )
-    print(f"✅ Данные успешно сохранены в файл: '{output_path}'")
+    print(f"Данные успешно сохранены в файл: '{output_path}'")
 
 
 # --- 2. Функция оценки и визуализации физических метрик ---
@@ -437,11 +432,9 @@ def evaluate_metrics_over_denoising_steps(
     """
     model.to(device)
     model.eval()
-
-    # Шаг 1: Собрать все данные из dataloader
+    
     all_x_real = []
     all_y_conditions = []
-    print("Собираем данные из всего даталоадера...")
     for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data"):
         all_x_real.append(x_real_batch)
         all_y_conditions.append(y_conditions_batch)
@@ -456,10 +449,6 @@ def evaluate_metrics_over_denoising_steps(
     
     n_samples = y_conditions.shape[0]
     shape = x_real.shape[1:]
-    
-    print(f"Оценка будет проводиться на {n_samples} семплах.")
-
-    # Шаг 3: Начать с чистого шума для всего набора данных
     x_gen = torch.rand(n_samples, *shape).to(device)
 
     denoising_scheduler = NOISE_SCHEDULERS.get(denoising_scheduler_name)
@@ -476,23 +465,12 @@ def evaluate_metrics_over_denoising_steps(
 
     with torch.no_grad():
         for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            # Шаг 4: Один шаг генерации для ВСЕХ изображений
             pred = model(x_gen, 0, y_conditions)
-            # Логика смешивания или шага шедулера должна быть здесь,
-            # если она более сложная, чем просто присваивание.
-            # Для простоты примера, используем предсказание модели.
             x_gen_step = pred
-
-            # Шаг 5: Оценить метрики на текущем шаге для ВСЕХ изображений
-            # Переводим в numpy для _calculate_physics_metrics
             gen_images_np = x_gen_step.cpu().numpy()
             real_images_np = x_real.cpu().numpy()
             conditions_np = y_conditions.cpu().numpy()
-            
-            # Считаем только ключевые метрики для скорости
             current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
-            
-            # Сохраняем историю
             metrics_history['step'].append(i)
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
             current_prd_auc_physics, current_prd_auc_physics_std = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
@@ -501,8 +479,6 @@ def evaluate_metrics_over_denoising_steps(
             metrics_history['PRD_physics_AUC'].append(current_prd_auc_physics)
             metrics_history['PRD_energy_AUC_std'].append(current_prd_auc_energy_std)
             metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
-
-            # Обновляем x_gen для следующего шага
             x_gen = x_gen_step
 
     print("Анализ по шагам завершен.")
@@ -525,7 +501,7 @@ def evaluate_metrics_over_denoising_steps(
     )
     plt.xlabel("Denoising Step")
     plt.ylabel("AUC Value")
-    plt.title("Изменение PRD AUC в процессе Denoising'а (на всем датасете)")
+    plt.title("Изменение PRD AUC в процессе Denoising'а")
     plt.legend()
     plt.grid(True)
     plt.show()
