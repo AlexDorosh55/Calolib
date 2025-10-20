@@ -419,7 +419,7 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
 
     pr_aucs = []
     for i in range(len(recalls)):
-        pr_aucs.append(auc(recisions[i], recalls[i]))
+        pr_aucs.append(auc(precisions[i], recalls[i]))
     std_pr_aucs = np.std(pr_aucs, axis=0)
 
     return pr_aucs, std_pr_aucs
