@@ -476,7 +476,7 @@ def evaluate_metrics_over_denoising_steps(
             # Оцениваем метрики на текущем шаге
             # Переводим в numpy для _calculate_physics_metrics
             gen_images_np = x_gen_step.cpu().numpy()
-            real_images_np = x_real.cpu().numpy()
+            real_images_np = torch.expm1(x_real).cpu().numpy()
             conditions_np = y_conditions.cpu().numpy()
             
             # Считаем только ключевые метрики для скорости
