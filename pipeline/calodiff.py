@@ -1,4 +1,5 @@
 # calodiff.py
+from thop import profile as thop_profile
 from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel
 import torch
 from torch import nn
@@ -11,6 +12,9 @@ import copy
 import numpy as np
 from sklearn.metrics import auc
 from typing import Callable, Optional, Dict, List, Tuple
+import torch.nn.functional as F
+from thop import profile as thop_profile
+from torch.profiler import profile, record_function, ProfilerActivity
 from pipeline.metrics import *
 from pipeline.custom_metrics import *
 from pipeline.physical_metrics.calogan_prd import get_energy_embedding, calc_pr_rec_from_embeds, plot_pr_aucs
@@ -531,3 +535,196 @@ def evaluate_metrics_over_denoising_steps(
     plt.show()
 
     return metrics_history
+def analyze_model_complexity(
+    model: nn.Module,
+    n_steps: int,
+    batch_size: int = 8,
+    image_size: int = 30,
+    conditions_dim: int = 9,
+    channels: int = 1,
+    print_thop: bool = False,
+    print_profiler: bool = False,
+    print_data_gen: bool = False,
+    verbose_thop: bool = False
+) -> float:
+    """
+    Анализирует вычислительную сложность модели (GFLOPS, параметры, время)
+    с использованием thop и PyTorch Profiler.
+
+    Аргументы:
+        model (nn.Module): Модель для анализа (например, 'net').
+        n_steps (int): Количество шагов, используемое для расчета общих GFLOPS.
+        batch_size (int, optional): Размер батча. По умолчанию 8.
+        image_size (int, optional): Размер изображения (предполагается квадратное). По умолчанию 30.
+        conditions_dim (int, optional): Размерность вектора условий (y). По умолчанию 9.
+        channels (int, optional): Количество входных каналов изображения. По умолчанию 1.
+        print_thop (bool, optional): Печатать ли сводку thop (GFLOPS, параметры). По умолчанию False.
+        print_profiler (bool, optional): Печатать ли детальный отчет PyTorch Profiler. По умолчанию False.
+        print_data_gen (bool, optional): Печатать ли анализ затрат на генерацию данных. По умолчанию False.
+        verbose_thop (bool, optional): Включить ли подробный вывод от самой thop. По умолчанию False.
+
+    Возвращает:
+        float: Суммарные GFLOPS на один батч (GFLOPS одного прохода * n_steps).
+               Возвращает -1.0 в случае ошибки thop.
+    """
+
+    # --- 0. Настройка устройства и модели ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval() # Важно для анализа, отключает dropout и т.д.
+
+    # Создание фиктивных данных
+    try:
+        dummy_x = torch.randn(batch_size, channels, image_size, image_size).to(device)
+        dummy_y = torch.randn(batch_size, conditions_dim).float().to(device)
+        dummy_t = 0  # Пример временного шага (можно использовать torch.randint)
+        
+        # Входы для thop в виде кортежа
+        thop_inputs = (dummy_x, dummy_t, dummy_y)
+    except Exception as e:
+        print(f"Ошибка при создании фиктивных тензоров: {e}")
+        return -1.0
+
+    # --- 1. Общий анализ с помощью thop ---
+    total_gflops_per_batch = -1.0  # Значение по умолчанию в случае ошибки
+    try:
+        # thop_profile может не поддерживать некоторые операции
+        macs, params = thop_profile(model, inputs=thop_inputs, verbose=verbose_thop)
+        gflops = 2 * macs / 1e9
+        total_gflops_per_batch = gflops * n_steps
+
+        if print_thop:
+            print("\n" + "="*50)
+            print("### 1. ОБЩИЙ АНАЛИЗ (THOP) ###")
+            print("="*50)
+            print(f"Модель '{type(model).__name__}' выполняет {gflops:.2f} GFLOPS за один проход.")
+            print(f"Количество параметров: {params / 1e6:.2f} M")
+            print(f"Суммарные вычисления на один батч ({n_steps} шагов): {total_gflops_per_batch:.2f} GFLOPS")
+
+    except Exception as e:
+        if print_thop:
+            print("\n" + "="*50)
+            print("### 1. ОБЩИЙ АНАЛИЗ (THOP) - ОШИБКА ###")
+            print("="*50)
+            print(f"Не удалось выполнить анализ thop: {e}")
+            print("Проверьте, поддерживает ли thop все операции в вашей модели.")
+
+
+    # --- 2. Детальный анализ по слоям с помощью PyTorch Profiler ---
+    if print_profiler:
+        print("\n" + "="*50)
+        print("### 2. ДЕТАЛЬНЫЙ АНАЛИЗ ПРОИЗВОДИТЕЛЬНОСТИ МОДЕЛИ ###")
+        print("="*50)
+
+        activities = [ProfilerActivity.CPU]
+        if device.type == 'cuda':
+            activities.append(ProfilerActivity.CUDA)
+
+        try:
+            with profile(
+                activities=activities,
+                record_shapes=True,
+                with_stack=True
+            ) as prof:
+                with record_function("model_inference"):
+                    model(*thop_inputs)
+            
+            sort_key = "cuda_time_total" if device.type == 'cuda' else "cpu_time_total"
+            
+            print(f"--- Топ 15 операций по времени выполнения ({device.type}) ---")
+            print(prof.key_averages().table(sort_by=sort_key, row_limit=15))
+
+            if device.type == 'cuda':
+                print("\n--- Топ 15 операций по использованию памяти на GPU ---")
+                print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=15))
+
+        except Exception as e:
+            print(f"Ошибка при выполнении PyTorch Profiler: {e}")
+
+
+    # --- 3. Анализ затрат на генерацию данных ---
+    if print_data_gen:
+        print("\n" + "="*50)
+        print("### 3. АНАЛИЗ ЗАТРАТ НА ГЕНЕРАЦИЮ ДАННЫХ ###")
+        print("="*50)
+
+        activities = [ProfilerActivity.CPU]
+        if device.type == 'cuda':
+            activities.append(ProfilerActivity.CUDA)
+            
+        try:
+            with profile(activities=activities) as prof_data:
+                _ = torch.randn(batch_size, channels, image_size, image_size).to(device)
+                _ = torch.randn(batch_size, conditions_dim).float().to(device)
+
+            sort_key = "cuda_time_total" if device.type == 'cuda' else "cpu_time_total"
+            print(f"--- Затраты на создание и перемещение тензоров ({device.type}) ---")
+            print(prof_data.key_averages().table(sort_by=sort_key, row_limit=10))
+        except Exception as e:
+             print(f"Ошибка при профилировании генерации данных: {e}")
+
+    # --- 4. Возврат основного значения ---
+    return total_gflops_per_batch
+
+# --- Пример использования ---
+if __name__ == "__main__":
+    
+    # Создадим фиктивную модель 'net' для демонстрации
+    class DummyNet(nn.Module):
+        def __init__(self, conditions_dim=9):
+            super().__init__()
+            self.conv1 = nn.Conv2d(1, 16, 3, 1, 1)
+            self.conv2 = nn.Conv2d(16, 32, 3, 1, 1)
+            # Слой, "использующий" y
+            self.fc_y = nn.Linear(conditions_dim, 32)
+            self.fc_out = nn.Linear(32 * 30 * 30, 10) 
+
+        def forward(self, x, t, y):
+            # t демонстративно не используется
+            x = F.relu(self.conv1(x))
+            x = F.relu(self.conv2(x))
+            
+            # "Используем" y: проецируем и добавляем к каналам x
+            y_proj = self.fc_y(y) # [B, 32]
+            y_proj = y_proj.unsqueeze(-1).unsqueeze(-1) # [B, 32, 1, 1]
+            x = x + y_proj # [B, 32, 30, 30]
+            
+            x = x.view(x.size(0), -1) # Flatten
+            x = self.fc_out(x)
+            return x
+
+    # --- Инициализация модели и параметров ---
+    net = DummyNet(conditions_dim=9)
+    n_steps_example = 100
+
+    print("--- 1. Вызов по умолчанию (только возврат GFLOPS) ---")
+    total_gflops = analyze_model_complexity(net, n_steps=n_steps_example)
+    print(f"Итоговые GFLOPS (по умолчанию): {total_gflops:.2f} GFLOPS")
+    print("="*60)
+
+
+    print("\n--- 2. Вызов с полным выводом ---")
+    total_gflops_verbose = analyze_model_complexity(
+        net,
+        n_steps=n_steps_example,
+        batch_size=8,
+        image_size=30,
+        conditions_dim=9,
+        print_thop=True,
+        print_profiler=True,
+        print_data_gen=True
+    )
+    print(f"\nИтоговые GFLOPS (с отчетами): {total_gflops_verbose:.2f} GFLOPS")
+    print("="*60)
+
+
+    print("\n--- 3. Вызов с измененными параметрами (только thop) ---")
+    total_gflops_large = analyze_model_complexity(
+        net,
+        n_steps=50,      # Меньше шагов
+        batch_size=16,   # Больше батч
+        image_size=64,   # Больше изображение
+        print_thop=True
+    )
+    print(f"\nИтоговые GFLOPS (другие параметры): {total_gflops_large:.2f} GFLOPS (ожидается ошибка или -1.0, если модель негибкая)")
+    print("="*60)
