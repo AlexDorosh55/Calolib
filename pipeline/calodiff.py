@@ -1,25 +1,45 @@
 # calodiff.py
-from thop import profile as thop_profile
-from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel
+# === Группа 1: Стандартные библиотеки Python ===
+import os
+import copy
+from typing import Callable, Optional, Dict, List, Tuple
+
+# === Группа 2: Сторонние библиотеки (Third-Party) ===
+
+# PyTorch и связанные утилиты
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# Научные вычисления и метрики
+import numpy as np
+from sklearn.metrics import auc
+
+# Модели (Diffusers, THOP)
+from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel
+from thop import profile as thop_profile
+
+# Визуализация и прогресс-бар
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm.auto import tqdm
-import os
-import copy
-import numpy as np
-from sklearn.metrics import auc
-from typing import Callable, Optional, Dict, List, Tuple
-import torch.nn.functional as F
-from thop import profile as thop_profile
-from torch.profiler import profile, record_function, ProfilerActivity
+
+# === Группа 3: Локальные импорты (проект 'pipeline') ===
 from pipeline.metrics import *
 from pipeline.custom_metrics import *
-from pipeline.physical_metrics.calogan_prd import get_energy_embedding, calc_pr_rec_from_embeds, plot_pr_aucs
 from pipeline.physical_metrics import calogan_metrics
-from pipeline.physical_metrics.prd_score import compute_prd_from_embedding, prd_to_max_f_beta_pair
+from pipeline.physical_metrics.calogan_prd import (
+    get_energy_embedding, 
+    calc_pr_rec_from_embeds, 
+    plot_pr_aucs
+)
+from pipeline.physical_metrics.prd_score import (
+    compute_prd_from_embedding, 
+    prd_to_max_f_beta_pair
+)
+
 
 def _cosine_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
     return 0.5 * (1 - torch.cos(torch.pi * t / t_max))
@@ -40,29 +60,45 @@ def sample(
         y_conditions: torch.Tensor,
         n_steps: int,
         device: str,
+        noise_scheduler_fn: Callable,  
         shape: tuple = (1, 30, 30),
-        sampling_method: str = "default"
+        sampling_method: str = "ddim"  
 ) -> torch.Tensor:
     """
     Функция для генерации изображений (инференса) - ИСПРАВЛЕННАЯ
+    Добавлен метод 'ddim', который корректно работает с scheduler'ом
     """
     n_samples = y_conditions.shape[0]
-    x_gen = torch.randn(n_samples, *shape).to(device) 
+
+    x_gen = torch.randn(n_samples, *shape).to(device)
     y_conditions = y_conditions.to(device)
 
     model.eval()
     with torch.no_grad():
-        if sampling_method == "default":
-            for i in tqdm(range(n_steps), desc="Sampling", leave=False):
+        if sampling_method == "ddim":
+            for i in tqdm(reversed(range(n_steps)), desc="Sampling (DDIM)", total=n_steps, leave=False):
+                t_tensor = torch.full((n_samples,), i, device=device, dtype=torch.long)
+                pred_x0 = model(x_gen, t_tensor, y_conditions)
+                t_float = t_tensor.float()
+                noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
+                signal_amount_t = 1.0 - noise_amount_t
+                t_prev_float = (t_float - 1).clamp(min=0)
+                noise_amount_t_prev = noise_scheduler_fn(t_prev_float, n_steps).view(-1, 1, 1, 1)
+                signal_amount_t_prev = 1.0 - noise_amount_t_prev
+                pred_noise = (x_gen - signal_amount_t * pred_x0) / (noise_amount_t + 1e-8)
+                x_gen = signal_amount_t_prev * pred_x0 + noise_amount_t_prev * pred_noise
+
+        elif sampling_method == "default":
+            print("Warning: Используется 'default' сэмплинг, который не связан с noise_scheduler'ом.")
+            for i in tqdm(range(n_steps), desc="Sampling (Default)", leave=False):
                 t = torch.full((n_samples,), i, device=device, dtype=torch.long)
-                pred = model(x_gen, t, y_conditions) 
+                pred = model(x_gen, t, y_conditions)
                 mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
                 x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
         else:
             raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
 
     return x_gen.cpu()
-
     
 def train(
     model: torch.nn.Module,
@@ -135,16 +171,20 @@ def train(
 
         # Визуализация (здесь все было в порядке)
         if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
-            model.eval() # <--- Не забываем переключить в eval для генерации
+            model.eval() 
             x_test_real, y_test = fixed_test_batch
-            # Перемещаем y_test на device, если он еще не там
             y_test = y_test.to(device) 
-            
-            # Генерируем изображения
+          
+          # Генерируем изображения
             generated_images = sample(
-                model, y_test, n_inference_steps, device,
-                shape=x_test_real.shape[1:]
-            )
+                model, 
+                y_test, 
+                n_inference_steps, 
+                device,
+                noise_scheduler_fn, 
+                shape=x_test_real.shape[1:],
+                sampling_method="ddim" 
+                  )
             n_samples_to_show = min(len(generated_images), 5)
             fig, axs = plt.subplots(1, n_samples_to_show, figsize=(20, 4))
             fig.suptitle(f"Test Batch Visualization at Epoch {epoch + 1}", fontsize=16)
