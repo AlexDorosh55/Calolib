@@ -21,103 +21,6 @@ from pipeline.physical_metrics.calogan_prd import get_energy_embedding, calc_pr_
 from pipeline.physical_metrics import calogan_metrics
 from pipeline.physical_metrics.prd_score import compute_prd_from_embedding, prd_to_max_f_beta_pair
 
-
-class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        batch_size, C, H, W = x.shape
-        # Compute query, key, value projections
-        q = self.query(x).view(batch_size, -1, H*W).permute(0, 2, 1)  # (B, H*W, C//8)
-        k = self.key(x).view(batch_size, -1, H*W)  # (B, C//8, H*W)
-        v = self.value(x).view(batch_size, -1, H*W)  # (B, C, H*W)
-        
-        # Compute attention map
-        attention = torch.bmm(q, k)  # (B, H*W, H*W)
-        attention = nn.functional.softmax(attention, dim=-1)
-        
-        # Apply attention to value and combine with residual
-        out = torch.bmm(v, attention.permute(0, 2, 1))  # (B, C, H*W)
-        out = out.view(batch_size, C, H, W)
-        return self.gamma * out + x
-        
-class MixedConditionedUnet(nn.Module):
-    def __init__(self, image_size=30, cond_emb_size=9):
-        super().__init__()
-
-        self.image_size = image_size  # Размер входного изображения (30x30)
-        self.cond_emb_size = cond_emb_size  # Количество параметров условия
-
-        # Преобразуем вектор условий [bs, 9] в тензор [bs, 128, 2, 2]
-        self.fc1 = nn.Linear(cond_emb_size, 128 * 2 * 2)
-
-        # Транспонированные сверточные слои, как в CaloganPhysicsGenerator
-        self.conv1 = nn.ConvTranspose2d(128, 128, 3, stride=2, padding=1, output_padding=1)
-        self.conv2 = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1)
-        self.conv3 = nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1)
-        self.conv4 = nn.ConvTranspose2d(32, 1, 3, stride=2, padding=1, output_padding=1)
-
-        self.bn1 = nn.BatchNorm2d(128)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(32)
-
-        self.attn2 = SelfAttention(64)
-        self.attn3 = SelfAttention(32)
-
-        # UNet принимает изображение + доп. каналы
-        self.model = UNet2DModel(
-            sample_size=image_size + 2,  # Учитываем паддинг
-            in_channels=2,  # 1 канал для изображения + 1 канал для условий
-            out_channels=1,
-            layers_per_block=2,
-            block_out_channels=(32, 64, 128),
-            down_block_types=("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"),
-            up_block_types=("AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"),
-        )
-
-    def forward(self, x, t, condition):
-        """
-        x         : входное изображение [bs, 1, 30, 30]
-        t         : временной шаг (для диффузии)
-        condition : вектор условий [bs, 9]
-        """
-        bs, ch, w, h = x.shape
-        # Добавляем паддинг, чтобы получить размер 32x32
-        x = torch.nn.functional.pad(x, (1, 1, 1, 1))  # [bs, 1, 32, 32]
-
-        # Кодируем вектор условий в тензор [bs, 128, 2, 2]
-        condition_emb = nn.functional.relu(self.fc1(condition)).view(bs, 128, 2, 2)
-
-        # Прогоняем через транспонированные сверточные слои
-        EnergyDeposit = nn.functional.relu(self.bn1(self.conv1(condition_emb)))
-        EnergyDeposit = nn.functional.relu(self.bn2(self.conv2(EnergyDeposit)))
-        EnergyDeposit = self.attn2(EnergyDeposit)
-        EnergyDeposit = nn.functional.relu(self.bn3(self.conv3(EnergyDeposit)))
-        EnergyDeposit = self.attn3(EnergyDeposit)
-        EnergyDeposit = nn.functional.relu(self.conv4(EnergyDeposit))
-
-        # Обрезаем до [bs, 1, 30, 30]
-        EnergyDeposit = EnergyDeposit[:, :, 1:31, 1:31]
-
-        # Добавляем паддинг, чтобы получить размер 32x32
-        EnergyDeposit = torch.nn.functional.pad(EnergyDeposit, (1, 1, 1, 1))  # [bs, 1, 32, 32]
-
-        # Объединяем изображение и условие по каналу
-        net_input = torch.cat((x, EnergyDeposit), 1)  # [bs, 2, 32, 32]
-
-        # Прогоняем через UNet
-        output = x - self.model(net_input, t).sample  # [bs, 1, 32, 32]
-
-        # Обрезаем до [bs, 1, 30, 30] перед возвратом
-        return output[:, :, 1:-1, 1:-1]
-
-# --- Scheduler'ы шума для обучения ---
-
 def _cosine_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
     return 0.5 * (1 - torch.cos(torch.pi * t / t_max))
 
@@ -141,17 +44,18 @@ def sample(
         sampling_method: str = "default"
 ) -> torch.Tensor:
     """
-    Функция для генерации изображений (инференса) с использованием обученной модели.
+    Функция для генерации изображений (инференса) - ИСПРАВЛЕННАЯ
     """
     n_samples = y_conditions.shape[0]
-    x_gen = torch.rand(n_samples, *shape).to(device)
+    x_gen = torch.randn(n_samples, *shape).to(device) 
     y_conditions = y_conditions.to(device)
 
     model.eval()
     with torch.no_grad():
         if sampling_method == "default":
             for i in tqdm(range(n_steps), desc="Sampling", leave=False):
-                pred = model(x_gen, 0, y_conditions)
+                t = torch.full((n_samples,), i, device=device, dtype=torch.long)
+                pred = model(x_gen, t, y_conditions) 
                 mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
                 x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
         else:
@@ -159,9 +63,7 @@ def sample(
 
     return x_gen.cpu()
 
-
-# --- Основная функция обучения ---
-
+    
 def train(
     model: torch.nn.Module,
     train_loader: DataLoader,
@@ -181,7 +83,7 @@ def train(
     test_visualization_func: Optional[Callable] = None
 ) -> Dict[str, List[float]]:
     """
-    Универсальная функция для обучения диффузионной модели.
+    Универсальная функция для обучения диффузионной модели. (ИСПРАВЛЕННАЯ ВЕРСИЯ)
     """
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
@@ -191,6 +93,8 @@ def train(
         raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
 
     history = {'train_loss': [], 'valid_loss': []}
+    best_valid_loss = float('inf')
+    best_model_state_on_valid = None 
     best_train_loss = float('inf')
     best_model_state_on_train = None
     patience_counter = 0
@@ -213,8 +117,8 @@ def train(
             noise_amount = noise_scheduler_fn(t.float(), n_inference_steps).view(-1, 1, 1, 1)
             noise = torch.randn_like(x)
             noisy_x = x * (1 - noise_amount) + noise * noise_amount
-            pred = model(noisy_x, 0, y)
-            loss = loss_fn(x, pred)
+            pred = model(noisy_x, t, y) 
+            loss = loss_fn(x, pred) 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -223,15 +127,20 @@ def train(
         avg_train_loss = sum(epoch_train_loss) / len(epoch_train_loss)
         history['train_loss'].append(avg_train_loss)
         print(f"Avg Train Loss: {avg_train_loss:.5f}")
-
         if avg_train_loss < best_train_loss:
             best_train_loss = avg_train_loss
             best_model_state_on_train = copy.deepcopy(model.state_dict())
             torch.save(best_model_state_on_train, os.path.join(checkpoint_path, "best_model_on_train.pth"))
-            print(f"🚀 New best model saved with train loss: {best_train_loss:.5f}")
+            print(f"🚀 New best train model saved with train loss: {best_train_loss:.5f}")
 
+        # Визуализация (здесь все было в порядке)
         if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
+            model.eval() # <--- Не забываем переключить в eval для генерации
             x_test_real, y_test = fixed_test_batch
+            # Перемещаем y_test на device, если он еще не там
+            y_test = y_test.to(device) 
+            
+            # Генерируем изображения
             generated_images = sample(
                 model, y_test, n_inference_steps, device,
                 shape=x_test_real.shape[1:]
@@ -244,14 +153,20 @@ def train(
                 test_visualization_func(energy=generated_images[i].cpu(), ax=ax)
             plt.show()
 
+
         if valid_loader and (epoch + 1) % validation_freq == 0:
-            model.eval()
+            model.eval() 
             epoch_valid_loss = []
-            with torch.no_grad():
+            with torch.no_grad(): 
                 for x_val, y_val in tqdm(valid_loader, desc="Validation"):
                     x_val, y_val = x_val.to(device), y_val.to(device)
-                    pred_val = model(x_val, 0, y_val)
-                    loss = loss_fn(x_val, pred_val)
+                    t_val = torch.randint(0, n_inference_steps, (x_val.shape[0],), device=device)
+                    noise_amount_val = noise_scheduler_fn(t_val.float(), n_inference_steps).view(-1, 1, 1, 1)
+                    noise_val = torch.randn_like(x_val)
+                    noisy_x_val = x_val * (1 - noise_amount_val) + noise_val * noise_amount_val
+                    pred_val = model(noisy_x_val, t_val, y_val)
+                    loss = loss_fn(x_val, pred_val) 
+                    
                     epoch_valid_loss.append(loss.item())
 
             avg_valid_loss = sum(epoch_valid_loss) / len(epoch_valid_loss)
@@ -260,26 +175,30 @@ def train(
 
             if lr_scheduler:
                 lr_scheduler.step(avg_valid_loss) if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) else lr_scheduler.step()
-
             if avg_valid_loss < best_valid_loss:
                 best_valid_loss = avg_valid_loss
-                patience_counter = 0
-                print(f"✨ Validation loss improved to: {best_valid_loss:.5f}")
+                best_model_state_on_valid = copy.deepcopy(model.state_dict())
+                torch.save(best_model_state_on_valid, os.path.join(checkpoint_path, "best_model_on_valid.pth"))
+                print(f"New best model saved with validation loss: {best_valid_loss:.5f}")
+                patience_counter = 0 
             elif early_stopping_patience:
                 patience_counter += 1
+                print(f"Patience counter: {patience_counter}/{early_stopping_patience}")
                 if patience_counter >= early_stopping_patience:
                     print(f"Stopping early. No improvement in validation loss for {patience_counter} epochs.")
-                    if best_model_state_on_train:
-                        model.load_state_dict(best_model_state_on_train)
+                    if best_model_state_on_valid:
+                        model.load_state_dict(best_model_state_on_valid)
                     return history
 
-    print("Training finished. Loading the best model based on training loss.")
-    if best_model_state_on_train:
+    print("Training finished.")
+    if best_model_state_on_valid:
+        print("Loading the best model based on validation loss.")
+        model.load_state_dict(best_model_state_on_valid)
+    elif best_model_state_on_train:
+        print("Warning: No best validation model found. Loading best model on train loss.")
         model.load_state_dict(best_model_state_on_train)
 
     return history
-
-# --- 1. Функция инференса с сохранением ---
 
 def inference_with_saving(
     model: torch.nn.Module,
