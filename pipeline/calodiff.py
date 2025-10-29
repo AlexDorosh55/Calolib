@@ -245,25 +245,38 @@ def inference_with_saving(
     dataloader: DataLoader,
     n_steps: int,
     device: str,
+    noise_scheduler_name: str = "cosine",     
     output_path: str = "generated_data.npz",
-    sampling_method: str = "default"
+    sampling_method: str = "ddim"      
 ):
     """
     Проводит инференс на всем даталоадере и сохраняет результаты в .npz файл.
+    (ИСПРАВЛЕННАЯ ВЕРСИЯ)
     """
+
+    noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
+    if not noise_scheduler_fn:
+        raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
+
     all_real_images, all_gen_images, all_conditions = [], [], []
     model.to(device)
     model.eval()
 
-    for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
-        x_gen = sample(
-            model, y_cond, n_steps, device,
-            shape=x_real.shape[1:],
-            sampling_method=sampling_method
-        )
-        all_real_images.append(x_real.cpu().numpy())
-        all_gen_images.append(x_gen.cpu().numpy())
-        all_conditions.append(y_cond.cpu().numpy())
+    with torch.no_grad(): 
+        for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
+            x_gen = sample(
+                model, 
+                y_cond, 
+                n_steps, 
+                device,
+                noise_scheduler_fn,          
+                shape=x_real.shape[1:],
+                sampling_method=sampling_method
+            )
+            
+            all_real_images.append(x_real.cpu().numpy())
+            all_gen_images.append(x_gen.cpu().numpy())
+            all_conditions.append(y_cond.cpu().numpy())
 
     real_images_np = np.vstack(all_real_images)
     gen_images_np = np.vstack(all_gen_images)
@@ -391,10 +404,18 @@ def evaluate_metrics_over_denoising_steps(
 ) -> Dict[str, List[float]]:
     """
     Оценивает изменение физических метрик на каждом шаге процесса denoising.
-    Обрабатывает данные по батчам, чтобы избежать переполнения памяти GPU.
+    (ИСПРАВЛЕННАЯ ВЕРСИЯ - реализует DDIM внутри)
     """
+    
+    # --- [ИЗМЕНЕНИЕ] Получаем функцию scheduler'а ---
+    noise_scheduler_fn = NOISE_SCHEDULERS.get(denoising_scheduler_name)
+    if not noise_scheduler_fn:
+        raise ValueError(f"Неизвестный scheduler шума: {denoising_scheduler_name}")
+        
     model.to(device)
     model.eval()
+    
+    # --- Загружаем все данные на CPU ---
     all_x_real = []
     all_y_conditions = []
     for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data to CPU"):
@@ -404,13 +425,18 @@ def evaluate_metrics_over_denoising_steps(
     if not all_x_real:
         print("Ошибка: dataloader пуст. Невозможно провести оценку.")
         return {}
+        
     x_real_cpu = torch.cat(all_x_real, dim=0)
     y_conditions_cpu = torch.cat(all_y_conditions, dim=0)
     
     n_samples = y_conditions_cpu.shape[0]
     shape = x_real_cpu.shape[1:]
-    x_gen_cpu = torch.rand(n_samples, *shape)
+    
+    # [ИЗМЕНЕНИЕ] Начинаем с НОРМАЛЬНОГО шума (x_T)
+    x_gen_cpu = torch.randn(n_samples, *shape) 
     batch_size = dataloader.batch_size
+    if batch_size is None: # На случай, если dataloader не батчевый
+        batch_size = n_samples 
 
     metrics_history = {
         'step': [],
@@ -420,24 +446,61 @@ def evaluate_metrics_over_denoising_steps(
         'PRD_physics_AUC_std': []
     }
 
+    real_images_np = x_real_cpu.numpy() # Реальные данные не меняются
+
     with torch.no_grad():
-        for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            generated_batches_for_step = []
+        # [ИЗМЕНЕНИЕ] Идем в обратном порядке: от T-1 до 0
+        for i in tqdm(reversed(range(n_steps)), desc="Evaluating Denoising Steps", total=n_steps):
+            
+            # Списки для сбора результатов этого шага
+            generated_x0_for_step = [] # Сюда соберем pred_x0
+            generated_x_prev_for_step = [] # Сюда соберем x_{t-1}
+
+            # --- Обрабатываем по батчам, чтобы не переполнить GPU ---
             for j in range(0, n_samples, batch_size):
+                # Берем текущее состояние x_t
                 x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
                 y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
-                pred_batch = model(x_gen_batch, 0, y_conditions_batch)
-                generated_batches_for_step.append(pred_batch.cpu())
-                del x_gen_batch, y_conditions_batch, pred_batch
+                
+                # [ИЗМЕНЕНИЕ] Корректно передаем текущий шаг 'i'
+                t_tensor = torch.full((x_gen_batch.shape[0],), i, device=device, dtype=torch.long)
+                
+                # --- [ИЗМЕНЕНИЕ] Полностью повторяем логику шага DDIM из sample ---
+                
+                # 1. Получаем предсказание модели (pred_x0)
+                pred_x0_batch = model(x_gen_batch, t_tensor, y_conditions_batch)
+
+                # 2. Получаем параметры расписания для t
+                t_float = t_tensor.float()
+                noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
+                signal_amount_t = 1.0 - noise_amount_t
+
+                # 3. Получаем параметры расписания для t-1
+                t_prev_float = (t_float - 1).clamp(min=0)
+                noise_amount_t_prev = noise_scheduler_fn(t_prev_float, n_steps).view(-1, 1, 1, 1)
+                signal_amount_t_prev = 1.0 - noise_amount_t_prev
+
+                # 4. Вычисляем предсказанный шум (pred_noise)
+                pred_noise_batch = (x_gen_batch - signal_amount_t * pred_x0_batch) / (noise_amount_t + 1e-8)
+
+                # 5. Делаем шаг назад x_t -> x_{t-1}
+                x_gen_next_batch = signal_amount_t_prev * pred_x0_batch + noise_amount_t_prev * pred_noise_batch
+                
+                # --- Сохраняем результаты ---
+                generated_x0_for_step.append(pred_x0_batch.cpu())
+                generated_x_prev_for_step.append(x_gen_next_batch.cpu())
+                
+                del x_gen_batch, y_conditions_batch, pred_x0_batch, x_gen_next_batch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            x_gen_cpu = torch.cat(generated_batches_for_step, dim=0)
-            gen_images_np = x_gen_cpu.numpy()
-            real_images_np = x_real_cpu.numpy()
+            x_gen_cpu = torch.cat(generated_x_prev_for_step, dim=0)
+            pred_x0_cpu_all = torch.cat(generated_x0_for_step, dim=0)
+            gen_images_np = pred_x0_cpu_all.numpy()
             conditions_np = y_conditions_cpu.numpy()
 
             current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
-            metrics_history['step'].append(i)
+            metrics_history['step'].append(i) 
+            
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
             current_prd_auc_physics, current_prd_auc_physics_std = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
             
@@ -447,8 +510,9 @@ def evaluate_metrics_over_denoising_steps(
             metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
 
     print("Анализ по шагам завершен.")
-    
-    # Визуализация результатов
+    for key in metrics_history:
+        metrics_history[key].reverse()
+        
     plt.figure(figsize=(12, 6))
     plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
     plt.fill_between(
@@ -464,7 +528,7 @@ def evaluate_metrics_over_denoising_steps(
         [m + s for m, s in zip(metrics_history['PRD_physics_AUC'], metrics_history['PRD_physics_AUC_std'])],
         alpha=0.2
     )
-    plt.xlabel("Denoising Step")
+    plt.xlabel("Denoising Step (0 -> T-1)") 
     plt.ylabel("AUC Value")
     plt.title("Изменение PRD AUC в процессе Denoising'а")
     plt.legend()
@@ -472,6 +536,8 @@ def evaluate_metrics_over_denoising_steps(
     plt.show()
 
     return metrics_history
+
+
 def analyze_model_complexity(
     model: nn.Module,
     n_steps: int,
