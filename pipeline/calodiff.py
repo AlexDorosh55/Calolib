@@ -395,8 +395,6 @@ def evaluate_metrics_over_denoising_steps(
     """
     model.to(device)
     model.eval()
-    
-    # Шаг 1: Загружаем все данные, но пока держим их на CPU
     all_x_real = []
     all_y_conditions = []
     for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data to CPU"):
@@ -406,18 +404,12 @@ def evaluate_metrics_over_denoising_steps(
     if not all_x_real:
         print("Ошибка: dataloader пуст. Невозможно провести оценку.")
         return {}
-
-    # Объединяем все батчи в единые тензоры на CPU
     x_real_cpu = torch.cat(all_x_real, dim=0)
     y_conditions_cpu = torch.cat(all_y_conditions, dim=0)
     
     n_samples = y_conditions_cpu.shape[0]
     shape = x_real_cpu.shape[1:]
-    
-    # Генерируем начальный шум тоже на CPU
     x_gen_cpu = torch.rand(n_samples, *shape)
-    
-    # Используем batch_size из оригинального dataloader'а
     batch_size = dataloader.batch_size
 
     metrics_history = {
@@ -430,30 +422,16 @@ def evaluate_metrics_over_denoising_steps(
 
     with torch.no_grad():
         for i in tqdm(range(n_steps), desc="Evaluating Denoising Steps"):
-            # Список для сбора результатов обработки батчей на текущем шаге
             generated_batches_for_step = []
-
-            # Итерируемся по данным батчами, чтобы прогнать через модель
             for j in range(0, n_samples, batch_size):
-                # Вырезаем текущий батч
                 x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
                 y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
-
-                # Вызов модели только для одного батча!
                 pred_batch = model(x_gen_batch, 0, y_conditions_batch)
-
-                # Возвращаем результат на CPU и добавляем в список
                 generated_batches_for_step.append(pred_batch.cpu())
-
-                # Очистка памяти GPU (опционально, но помогает)
                 del x_gen_batch, y_conditions_batch, pred_batch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-            # Собираем результаты всех батчей в один тензор на CPU
             x_gen_cpu = torch.cat(generated_batches_for_step, dim=0)
-
-            # Дальнейшие вычисления метрик, как и раньше
             gen_images_np = x_gen_cpu.numpy()
             real_images_np = x_real_cpu.numpy()
             conditions_np = y_conditions_cpu.numpy()
@@ -599,18 +577,13 @@ def analyze_model_complexity(
 
         except Exception as e:
             print(f"Ошибка при выполнении PyTorch Profiler: {e}")
-
-
-    # --- 3. Анализ затрат на генерацию данных ---
     if print_data_gen:
         print("\n" + "="*50)
         print("### 3. АНАЛИЗ ЗАТРАТ НА ГЕНЕРАЦИЮ ДАННЫХ ###")
         print("="*50)
-
         activities = [ProfilerActivity.CPU]
         if device.type == 'cuda':
             activities.append(ProfilerActivity.CUDA)
-            
         try:
             with profile(activities=activities) as prof_data:
                 _ = torch.randn(batch_size, channels, image_size, image_size).to(device)
@@ -621,6 +594,4 @@ def analyze_model_complexity(
             print(prof_data.key_averages().table(sort_by=sort_key, row_limit=10))
         except Exception as e:
              print(f"Ошибка при профилировании генерации данных: {e}")
-
-    # --- 4. Возврат основного значения ---
     return total_gflops_per_batch
