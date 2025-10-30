@@ -304,8 +304,8 @@ def _calculate_physics_metrics(
     gen_images: np.ndarray,
     real_images: np.ndarray,
     conditions: np.ndarray,
-    num_clusters: int = 20,
-    max_width_threshold: float = 14.5  # <--- ВАШ ПОРОГ
+    num_clusters: int = 20
+    # <--- max_width_threshold УДАЛЕН ИЗ АРГУМЕНТОВ
 ) -> Dict[str, np.ndarray]:
     """Вспомогательная функция для расчета физических метрик."""
     gen_images_sq = gen_images.reshape(-1, 30, 30) if gen_images.shape[1] == 1 else gen_images
@@ -322,6 +322,18 @@ def _calculate_physics_metrics(
         "Real Longitudual Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Real Transverse Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
     }
+
+    valid_real_long_width = metrics["Real Longitudual Width"][np.isfinite(metrics["Real Longitudual Width"])]
+    valid_real_trans_width = metrics["Real Transverse Width"][np.isfinite(metrics["Real Transverse Width"])]
+
+    # Находим максимум среди продольной и поперечной ширины
+    max_real_long = np.max(valid_real_long_width) if len(valid_real_long_width) > 0 else np.inf
+    max_real_trans = np.max(valid_real_trans_width) if len(valid_real_trans_width) > 0 else np.inf
+    
+    max_width_threshold = max(max_real_long, max_real_trans)
+    
+    print(f"Используемый динамический порог (макс. из 'Real'): {max_width_threshold}")
+
     gen_mask = (metrics["Gen Longitudual Width"] <= max_width_threshold) & \
                (metrics["Gen Transverse Width"] <= max_width_threshold) & \
                np.isfinite(metrics["Gen Longitudual Width"]) & \
@@ -331,7 +343,7 @@ def _calculate_physics_metrics(
                 (metrics["Real Transverse Width"] <= max_width_threshold) & \
                 np.isfinite(metrics["Real Longitudual Width"]) & \
                 np.isfinite(metrics["Real Transverse Width"])
-    
+
     
     print(f"Отфильтровано 'Gen' выбросов (Width > {max_width_threshold}): {np.sum(~gen_mask)}")
     print(f"Отфильтровано 'Real' выбросов (Width > {max_width_threshold}): {np.sum(~real_mask)}")
@@ -360,12 +372,14 @@ def _calculate_physics_metrics(
         gen_images.reshape(gen_images.shape[0], -1), 
         real_images.reshape(real_images.shape[0], -1), 
         num_clusters=num_clusters
+
     )
     
     precision_physics, recall_physics = calc_pr_rec_from_embeds(
         gen_physics_stats, 
         real_physics_stats, 
-        num_clusters=num_clusters
+        num_clusters=num_clusters,
+        enforce_balance=False  
     )
 
     metrics.update({
