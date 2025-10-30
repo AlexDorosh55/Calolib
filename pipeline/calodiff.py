@@ -304,12 +304,14 @@ def _calculate_physics_metrics(
     gen_images: np.ndarray,
     real_images: np.ndarray,
     conditions: np.ndarray,
-    num_clusters: int = 20
+    num_clusters: int = 20,
+    max_width_threshold: float = 14.5  # <--- ВАШ ПОРОГ
 ) -> Dict[str, np.ndarray]:
     """Вспомогательная функция для расчета физических метрик."""
     gen_images_sq = gen_images.reshape(-1, 30, 30) if gen_images.shape[1] == 1 else gen_images
     real_images_sq = real_images.reshape(-1, 30, 30) if real_images.shape[1] == 1 else real_images
 
+    # 1. Сначала считаем ВСЕ метрики, включая выбросы
     metrics = {
         "Gen Longitudual Asymmetry": calogan_metrics.get_assymetry(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Gen Transverse Asymmetry": calogan_metrics.get_assymetry(gen_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
@@ -320,12 +322,51 @@ def _calculate_physics_metrics(
         "Real Longitudual Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=False).flatten(),
         "Real Transverse Width": calogan_metrics.get_shower_width(real_images_sq, conditions[:, 0:3], conditions[:, 6:], orthog=True).flatten(),
     }
+    gen_mask = (metrics["Gen Longitudual Width"] <= max_width_threshold) & \
+               (metrics["Gen Transverse Width"] <= max_width_threshold) & \
+               np.isfinite(metrics["Gen Longitudual Width"]) & \
+               np.isfinite(metrics["Gen Transverse Width"])
 
-    gen_physics_stats = np.stack([metrics["Gen Longitudual Asymmetry"], metrics["Gen Transverse Asymmetry"], metrics["Gen Longitudual Width"], metrics["Gen Transverse Width"]], axis=1)
-    real_physics_stats = np.stack([metrics["Real Longitudual Asymmetry"], metrics["Real Transverse Asymmetry"], metrics["Real Longitudual Width"], metrics["Real Transverse Width"]], axis=1)
+    real_mask = (metrics["Real Longitudual Width"] <= max_width_threshold) & \
+                (metrics["Real Transverse Width"] <= max_width_threshold) & \
+                np.isfinite(metrics["Real Longitudual Width"]) & \
+                np.isfinite(metrics["Real Transverse Width"])
+    
+    
+    print(f"Отфильтровано 'Gen' выбросов (Width > {max_width_threshold}): {np.sum(~gen_mask)}")
+    print(f"Отфильтровано 'Real' выбросов (Width > {max_width_threshold}): {np.sum(~real_mask)}")
+    
+    for key in metrics.keys():
+        if key.startswith("Gen"):
+            metrics[key] = metrics[key][gen_mask]
+        elif key.startswith("Real"):
+            metrics[key] = metrics[key][real_mask]
 
-    precision_energy, recall_energy = calc_pr_rec_from_embeds(gen_images.reshape(gen_images.shape[0], -1), real_images.reshape(real_images.shape[0], -1), num_clusters=num_clusters)
-    precision_physics, recall_physics = calc_pr_rec_from_embeds(gen_physics_stats, real_physics_stats, num_clusters=num_clusters)
+    gen_physics_stats = np.stack([
+        metrics["Gen Longitudual Asymmetry"],
+        metrics["Gen Transverse Asymmetry"],
+        metrics["Gen Longitudual Width"],
+        metrics["Gen Transverse Width"]
+    ], axis=1)
+    
+    real_physics_stats = np.stack([
+        metrics["Real Longitudual Asymmetry"],
+        metrics["Real Transverse Asymmetry"],
+        metrics["Real Longitudual Width"],
+        metrics["Real Transverse Width"]
+    ], axis=1)
+
+    precision_energy, recall_energy = calc_pr_rec_from_embeds(
+        gen_images.reshape(gen_images.shape[0], -1), 
+        real_images.reshape(real_images.shape[0], -1), 
+        num_clusters=num_clusters
+    )
+    
+    precision_physics, recall_physics = calc_pr_rec_from_embeds(
+        gen_physics_stats, 
+        real_physics_stats, 
+        num_clusters=num_clusters
+    )
 
     metrics.update({
         'PRD_energy_AUC': np.trapz(precision_energy, recall_energy),
@@ -333,6 +374,7 @@ def _calculate_physics_metrics(
         'PRD_physics_AUC': np.trapz(precision_physics, recall_physics),
         'precision_physics': precision_physics, 'recall_physics': recall_physics
     })
+    
     return metrics
 
 def evaluate_and_visualize_physics_metrics(
