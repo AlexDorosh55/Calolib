@@ -251,7 +251,6 @@ def inference_with_saving(
 ):
     """
     Проводит инференс на всем даталоадере и сохраняет результаты в .npz файл.
-    (ИСПРАВЛЕННАЯ ВЕРСИЯ)
     """
 
     noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
@@ -331,8 +330,6 @@ def _calculate_physics_metrics(
     max_real_trans = np.max(valid_real_trans_width) if len(valid_real_trans_width) > 0 else np.inf
     
     max_width_threshold = max(max_real_long, max_real_trans)
-    
-    print(f"Используемый динамический порог (макс. из 'Real'): {max_width_threshold}")
 
     gen_mask = (metrics["Gen Longitudual Width"] <= max_width_threshold) & \
                (metrics["Gen Transverse Width"] <= max_width_threshold) & \
@@ -343,10 +340,6 @@ def _calculate_physics_metrics(
                 (metrics["Real Transverse Width"] <= max_width_threshold) & \
                 np.isfinite(metrics["Real Longitudual Width"]) & \
                 np.isfinite(metrics["Real Transverse Width"])
-
-    
-    print(f"Отфильтровано 'Gen' выбросов (Width > {max_width_threshold}): {np.sum(~gen_mask)}")
-    print(f"Отфильтровано 'Real' выбросов (Width > {max_width_threshold}): {np.sum(~real_mask)}")
     
     for key in metrics.keys():
         if key.startswith("Gen"):
@@ -531,7 +524,7 @@ def evaluate_metrics_over_denoising_steps(
             gen_images_np = pred_x0_cpu_all.numpy()
             conditions_np = y_conditions_cpu.numpy()
 
-            current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
+            current_metrics = _calculate_physics_metrics(torch.maximum(generated_images, torch.tensor(0)), real_images_np, conditions_np)
             metrics_history['step'].append(i) 
             
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
