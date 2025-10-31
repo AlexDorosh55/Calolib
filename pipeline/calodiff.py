@@ -521,10 +521,10 @@ def evaluate_metrics_over_denoising_steps(
             x_gen_cpu = torch.cat(generated_x_prev_for_step, dim=0)
             
             pred_x0_cpu_all = torch.cat(generated_x0_for_step, dim=0)
-            gen_images_np = pred_x0_cpu_all.numpy()
+            gen_images_np = torch.maximum(pred_x0_cpu_all, torch.tensor(0)).numpy()
             conditions_np = y_conditions_cpu.numpy()
 
-            current_metrics = _calculate_physics_metrics(torch.maximum(generated_images, torch.tensor(0)), real_images_np, conditions_np)
+            current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
             metrics_history['step'].append(i) 
             
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
