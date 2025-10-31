@@ -454,9 +454,9 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
 def evaluate_metrics_over_denoising_steps(
     model: torch.nn.Module,
     dataloader: DataLoader,
-    n_steps: int,
-    device: str,
-    denoising_scheduler_name: str = "cosine"
+    n_steps: int,
+    device: str,
+    denoising_scheduler_name: str = "cosine"
 ) -> Dict[str, List[float]]:
     """
     Оценивает изменение физических метрик на каждом шаге процесса denoising.
