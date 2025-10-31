@@ -452,8 +452,8 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
     return np.mean(pr_aucs), std_pr_aucs
 
 def evaluate_metrics_over_denoising_steps(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
+    model: torch.nn.Module,
+    dataloader: DataLoader,
     n_steps: int,
     device: str,
     denoising_scheduler_name: str = "cosine"
