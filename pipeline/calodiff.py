@@ -458,10 +458,6 @@ def evaluate_metrics_over_denoising_steps(
     device: str,
     denoising_scheduler_name: str = "cosine"
 ) -> Dict[str, List[float]]:
-    """
-    Оценивает изменение физических метрик на каждом шаге процесса denoising.
-    **Включает оценку на шаге T (n_steps).**
-    """
     noise_scheduler_fn = NOISE_SCHEDULERS.get(denoising_scheduler_name)
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {denoising_scheduler_name}")
