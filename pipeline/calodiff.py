@@ -15,6 +15,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 # Научные вычисления и метрики
 import numpy as np
+import pandas as pd
 from sklearn.metrics import auc
 
 # Модели (Diffusers, THOP)
@@ -402,11 +403,30 @@ def evaluate_and_visualize_physics_metrics(
     sns.set_theme(style="whitegrid")
 
     for statistic in statistics_to_plot:
+        # 1. Получаем данные
+        gen_data = scores['Gen ' + statistic]
+        real_data = scores['Real ' + statistic]
+
+        # 2. Создаем DataFrame для seaborn
+        gen_df = pd.DataFrame({'value': gen_data, 'source': 'Generated'})
+        real_df = pd.DataFrame({'value': real_data, 'source': 'Real'})
+        combined_df = pd.concat([gen_df, real_df])
+
+        # 3. Строим один график с параметром hue
         plt.figure(figsize=(10, 6))
-        sns.histplot(scores['Gen ' + statistic], bins=50, alpha=0.6, label="Generated", color="orange", kde=True)
-        sns.histplot(scores['Real ' + statistic], bins=50, alpha=0.6, label="Real", color="blue", kde=True)
+        sns.histplot(
+            data=combined_df,      # Используем объединенный DataFrame
+            x='value',             # Указываем столбец со значениями
+            hue='source',          # Указываем столбец для разделения (Gen/Real)
+            bins=50,               # Теперь 50 бинов будут общими
+            alpha=0.6,
+            kde=True,
+            palette={'Generated': 'orange', 'Real': 'blue'} # Сохраняем ваши цвета
+        )
+        
         plt.title(f"Distribution of {statistic}", fontsize=14, fontweight='bold')
-        plt.legend()
+        plt.xlabel(statistic) # Добавляем подпись к оси X
+        # plt.legend() # 'hue' автоматически создает легенду
         plt.tight_layout()
         plt.show()
 
