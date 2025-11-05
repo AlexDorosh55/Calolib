@@ -394,6 +394,7 @@ def evaluate_and_visualize_physics_metrics(
 ):
     """
     Вычисляет и визуализирует физические метрики для сгенерированных и реальных изображений.
+    Ось X на гистограммах ограничена диапазоном реальных данных.
     """
     scores = _calculate_physics_metrics(
         gen_images.cpu().numpy(), real_images.cpu().numpy(), conditions.cpu().numpy(), num_clusters
@@ -405,27 +406,42 @@ def evaluate_and_visualize_physics_metrics(
     for statistic in statistics_to_plot:
         # 1. Получаем данные
         gen_data = scores['Gen ' + statistic]
-        real_data = scores['Real ' + statistic]
+        real_data = scores['Real ' + statistic] # Это массив numpy
 
         # 2. Создаем DataFrame для seaborn
         gen_df = pd.DataFrame({'value': gen_data, 'source': 'Generated'})
         real_df = pd.DataFrame({'value': real_data, 'source': 'Real'})
         combined_df = pd.concat([gen_df, real_df])
 
+        ### НОВОЕ: Рассчитываем лимиты для оси X на основе РЕАЛЬНЫХ данных ###
+        min_val = np.min(real_data)
+        max_val = np.max(real_data)
+        # Добавляем небольшой отступ (5% от диапазона), чтобы график не обрезался по краям
+        padding = (max_val - min_val) * 0.05
+        
+        x_min_limit = min_val - padding
+        x_max_limit = max_val + padding
+        ####################################################################
+
         # 3. Строим один график с параметром hue
         plt.figure(figsize=(10, 6))
         sns.histplot(
-            data=combined_df,      # Используем объединенный DataFrame
-            x='value',             # Указываем столбец со значениями
-            hue='source',          # Указываем столбец для разделения (Gen/Real)
-            bins=50,               # Теперь 50 бинов будут общими
+            data=combined_df,
+            x='value',
+            hue='source',
+            bins=50,
             alpha=0.6,
             kde=True,
-            palette={'Generated': 'orange', 'Real': 'blue'} # Сохраняем ваши цвета
+            palette={'Generated': 'orange', 'Real': 'blue'}
         )
         
         plt.title(f"Distribution of {statistic}", fontsize=14, fontweight='bold')
-        plt.xlabel(statistic) # Добавляем подпись к оси X
+        plt.xlabel(statistic)
+
+        ### НОВОЕ: Применяем рассчитанные лимиты к оси X ###
+        plt.xlim(x_min_limit, x_max_limit)
+        ###################################################
+        
         # plt.legend() # 'hue' автоматически создает легенду
         plt.tight_layout()
         plt.show()
