@@ -464,19 +464,35 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
 
     return np.mean(pr_aucs), std_pr_aucs
 
-def evaluate_metrics_over_denoising_steps(
+def evaluate_metrics_over_denoising_steps_fixed(
     model: torch.nn.Module,
     dataloader: DataLoader,
     n_steps: int,
     device: str,
-    denoising_scheduler_name: str = "cosine"
+    denoising_scheduler_name: str = "cosine",
+    initial_noise: Optional[torch.Tensor] = None, # <-- ИСПРАВЛЕНИЕ 1: Для воспроизводимости
+    apply_expm1: bool = True                      # <-- ИСПРАВЛЕНИЕ 2: Для корректных метрик
 ) -> Dict[str, List[float]]:
+    """
+    Проводит оценку метрик на каждом шаге процесса расшумления.
+    
+    Args:
+        ...
+        initial_noise (Optional[torch.Tensor]): 
+            Предопределенный начальный шум для воспроизводимости. 
+            Если None, генерируется новый.
+        apply_expm1 (bool): 
+            Если True, применяет torch.expm1 к реальным и сгенерированным 
+            данным перед подсчетом метрик.
+    """
     noise_scheduler_fn = NOISE_SCHEDULERS.get(denoising_scheduler_name)
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {denoising_scheduler_name}")
         
     model.to(device)
     model.eval()
+    
+    # 1. Загружаем все данные на CPU
     all_x_real = []
     all_y_conditions = []
     for x_real_batch, y_conditions_batch in tqdm(dataloader, desc="Loading data to CPU"):
@@ -492,7 +508,18 @@ def evaluate_metrics_over_denoising_steps(
     
     n_samples = y_conditions_cpu.shape[0]
     shape = x_real_cpu.shape[1:]
-    x_gen_cpu = torch.randn(n_samples, *shape) 
+
+    # --- ИСПРАВЛЕНИЕ 1: Воспроизводимый шум ---
+    if initial_noise is None:
+        print("Генерация нового начального шума...")
+        x_gen_cpu = torch.randn(n_samples, *shape)
+    else:
+        print("Использование предоставленного начального шума...")
+        if initial_noise.shape != (n_samples, *shape):
+            raise ValueError(f"Форма initial_noise ({initial_noise.shape}) не совпадает с ожидаемой ({(n_samples, *shape)})")
+        x_gen_cpu = initial_noise.clone()
+    # --- Конец ИСПРАВЛЕНИЯ 1 ---
+
     batch_size = dataloader.batch_size
     if batch_size is None: 
         batch_size = n_samples 
@@ -505,21 +532,38 @@ def evaluate_metrics_over_denoising_steps(
         'PRD_physics_AUC_std': []
     }
 
-    real_images_np = x_real_cpu.numpy() 
+    # --- ИСПРАВЛЕНИЕ 2 (Часть А): Подготовка реальных данных ---
+    # Применяем expm1 к реальным данным ОДИН РАЗ, если нужно
+    if apply_expm1:
+        print("Применение torch.expm1 к реальным данным...")
+        real_images_eval = torch.expm1(x_real_cpu)
+    else:
+        real_images_eval = x_real_cpu
+    
+    # Конвертируем в numpy и освобождаем память
+    real_images_np = real_images_eval.cpu().numpy()
+    del real_images_eval 
+    
+    conditions_np = y_conditions_cpu.numpy() # Условия не меняются
 
     with torch.no_grad():
+        # Идем от t=n_steps до t=0
         for i in tqdm(reversed(range(n_steps + 1)), desc="Evaluating Denoising Steps", total=n_steps + 1):
             
-            generated_x0_for_step = [] 
-            generated_x_prev_for_step = [] 
+            generated_x0_for_step = []    # Сюда соберем предсказания x0 на этом шаге
+            generated_x_prev_for_step = [] # Сюда соберем x_{t-1} для следующей итерации
 
+            # Итерация по батчам
             for j in range(0, n_samples, batch_size):
                 x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
                 y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
                 
                 t_tensor = torch.full((x_gen_batch.shape[0],), i, device=device, dtype=torch.long)
+                
+                # 1. Предсказываем x0
                 pred_x0_batch = model(x_gen_batch, t_tensor, y_conditions_batch)
                 
+                # 2. Вычисляем x_{t-1} для следующего шага (DDIM-подобный семплинг)
                 t_float = t_tensor.float()
                 noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
                 signal_amount_t = 1.0 - noise_amount_t
@@ -531,6 +575,7 @@ def evaluate_metrics_over_denoising_steps(
                 pred_noise_batch = (x_gen_batch - signal_amount_t * pred_x0_batch) / (noise_amount_t + 1e-8)
                 x_gen_next_batch = signal_amount_t_prev * pred_x0_batch + noise_amount_t_prev * pred_noise_batch
                 
+                # Сохраняем результаты
                 generated_x0_for_step.append(pred_x0_batch.cpu())
                 generated_x_prev_for_step.append(x_gen_next_batch.cpu())
                 
@@ -539,12 +584,15 @@ def evaluate_metrics_over_denoising_steps(
                     torch.cuda.empty_cache()
             
             x_gen_cpu = torch.cat(generated_x_prev_for_step, dim=0)
-            
             pred_x0_cpu_all = torch.cat(generated_x0_for_step, dim=0)
-            gen_images_np = torch.maximum(pred_x0_cpu_all, torch.tensor(0)).numpy()
-            conditions_np = y_conditions_cpu.numpy()
+            
+            gen_images_eval = torch.maximum(pred_x0_cpu_all, torch.tensor(0))
+            if apply_expm1:
+                gen_images_eval = torch.expm1(gen_images_eval)
 
+            gen_images_np = gen_images_eval.cpu().numpy()
             current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
+            
             metrics_history['step'].append(i) 
             
             current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
@@ -559,7 +607,7 @@ def evaluate_metrics_over_denoising_steps(
     
     for key in metrics_history:
         metrics_history[key].reverse()
-        
+    
     plt.figure(figsize=(12, 6))
     plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
     plt.fill_between(
