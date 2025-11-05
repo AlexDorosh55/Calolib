@@ -415,7 +415,7 @@ def evaluate_and_visualize_physics_metrics(
 
         ### НОВОЕ: Рассчитываем лимиты для оси X на основе РЕАЛЬНЫХ данных ###
         min_val = np.min(real_data)
-        max_val = np.min(np.max(real_data), 500)
+        max_val = min(np.max(real_data), 500)
         # Добавляем небольшой отступ (5% от диапазона), чтобы график не обрезался по краям
         padding = (max_val - min_val) * 0.05
         
