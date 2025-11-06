@@ -602,9 +602,6 @@ def evaluate_metrics_over_denoising_steps(
             metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
 
     print("Анализ по шагам завершен.")
-    
-    for key in metrics_history:
-        metrics_history[key].reverse()
         
     plt.figure(figsize=(12, 6))
     plt.plot(metrics_history['step'], metrics_history['PRD_energy_AUC'], label='PRD Energy AUC', marker='.')
