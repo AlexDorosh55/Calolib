@@ -48,13 +48,8 @@ def _cosine_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
 def _linear_noise_scheduler(t: torch.Tensor, t_max: int) -> torch.Tensor:
     return t / t_max
 
-cosine_scheduler = DDPMScheduler(
-    beta_schedule="cosine",    
-    num_train_timesteps=100
-)
-
 NOISE_SCHEDULERS = {
-    "cosine": cosine_scheduler,
+    "cosine": _cosine_noise_scheduler,
     "linear": _linear_noise_scheduler
 }
 
