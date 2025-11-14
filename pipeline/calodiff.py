@@ -419,6 +419,7 @@ def evaluate_and_visualize_physics_metrics(
             x='value',
             hue='source',
             bins=100,
+            binrange=(x_min_limit, x_max_limit),
             alpha=0.6,
             kde=True,
             palette={'Generated': 'orange', 'Real': 'blue'}
