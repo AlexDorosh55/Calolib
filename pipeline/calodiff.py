@@ -408,7 +408,7 @@ def evaluate_and_visualize_physics_metrics(
         combined_df = pd.concat([gen_df, real_df])
 
         min_val = np.min(real_data)
-        max_val = min(np.max(real_data), 500)
+        max_val = min(np.max(real_data), 130)
         padding = (max_val - min_val) * 0.05
         
         x_min_limit = min_val - padding
