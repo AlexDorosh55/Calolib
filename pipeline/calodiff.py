@@ -170,13 +170,11 @@ def train(
             torch.save(best_model_state_on_train, os.path.join(checkpoint_path, "best_model_on_train.pth"))
             print(f"🚀 New best train model saved with train loss: {best_train_loss:.5f}")
 
-        # Визуализация (здесь все было в порядке)
         if visualize_test_batch and fixed_test_batch is not None and test_visualization_func is not None:
             model.eval() 
             x_test_real, y_test = fixed_test_batch
             y_test = y_test.to(device) 
           
-          # Генерируем изображения
             generated_images = sample(
                 model, 
                 y_test, 
@@ -322,7 +320,6 @@ def _calculate_physics_metrics(
     valid_real_long_width = metrics["Real Longitudual Width"][np.isfinite(metrics["Real Longitudual Width"])]
     valid_real_trans_width = metrics["Real Transverse Width"][np.isfinite(metrics["Real Transverse Width"])]
 
-    # Находим максимум среди продольной и поперечной ширины
     max_real_long = np.max(valid_real_long_width) if len(valid_real_long_width) > 0 else np.inf
     max_real_trans = np.max(valid_real_trans_width) if len(valid_real_trans_width) > 0 else np.inf
     
@@ -465,8 +462,8 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
 def evaluate_metrics_over_denoising_steps(
     model: torch.nn.Module,
     dataloader: DataLoader,
-    n_steps: int,                      # Число шагов инференса (e.g. 100)
-    t_train_max: int,                  # Число шагов обучения (e.g. 1000)
+    n_steps: int,                      
+    t_train_max: int,                  
     device: str,
     denoising_scheduler_name: str = "cosine",
     initial_noise: Optional[torch.Tensor] = None,
@@ -484,8 +481,6 @@ def evaluate_metrics_over_denoising_steps(
     model.to(device)
     model.eval()
     
-    # 1. Загружаем все данные на CPU (как у вас)
-    print("Loading data to CPU...")
     all_x_real = []
     all_y_conditions = []
     for x_real_batch, y_conditions_batch in dataloader:
@@ -502,7 +497,6 @@ def evaluate_metrics_over_denoising_steps(
     n_samples = y_conditions_cpu.shape[0]
     shape = x_real_cpu.shape[1:]
 
-    # 2. Подготовка шума (как у вас)
     if initial_noise is None:
         x_gen_cpu = torch.randn(n_samples, *shape)
     else:
@@ -511,12 +505,11 @@ def evaluate_metrics_over_denoising_steps(
     batch_size = dataloader.batch_size or n_samples
 
     metrics_history = {
-        'step': [], 'timestep': [], # Добавил timestep для отладки
+        'step': [], 'timestep': [], 
         'PRD_energy_AUC': [], 'PRD_physics_AUC': [],
         'PRD_energy_AUC_std': [], 'PRD_physics_AUC_std': []
     }
 
-    # 3. Подготовка реальных данных (как у вас)
     if apply_expm1:
         real_images_eval = torch.expm1(x_real_cpu)
     else:
@@ -527,32 +520,21 @@ def evaluate_metrics_over_denoising_steps(
     conditions_np = y_conditions_cpu.numpy()
 
     with torch.no_grad():
-        # Используем ваш цикл: i идет от n_steps до 0
+
         for i in tqdm(reversed(range(n_steps + 1)), desc="Evaluating Denoising Steps", total=n_steps + 1):
             
             generated_x0_for_step = []
             generated_x_prev_for_step = []
-
-            # --- KЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
-            # 1. Масштабируем 'i' (индекс шага) в 't' (временной шаг)
-            # t = i * (T_train / n_steps)
-            # Мы используем .floor(), чтобы t=0 остался t=0
-            
             t_val = torch.floor(torch.tensor(i) * (t_train_max / n_steps)).long()
             
-            # t_prev будет для i-1
             t_prev_val = torch.floor(torch.tensor(i - 1) * (t_train_max / n_steps)).clamp(min=0).long()
             
-            # 2. Получаем alpha_bar для t и t_prev, используя t_train_max
-            # Передаем скалярные тензоры, чтобы получить скалярные alpha_bar
             noise_amount_t = noise_scheduler_fn(t_val.float(), t_train_max).to(device)
             signal_amount_t = 1.0 - noise_amount_t
             
             noise_amount_t_prev = noise_scheduler_fn(t_prev_val.float(), t_train_max).to(device)
             signal_amount_t_prev = 1.0 - noise_amount_t_prev
-            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-            # Итерация по батчам
             for j in range(0, n_samples, batch_size):
                 x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
                 y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
@@ -560,11 +542,8 @@ def evaluate_metrics_over_denoising_steps(
 
                 t_tensor_batch = torch.full((x_gen_batch.shape[0],), t_val.item(), device=device, dtype=torch.long)
                 
-                # 1. Предсказываем x0 (модель получает правильный t)
                 pred_x0_batch = model(x_gen_batch, t_tensor_batch, y_conditions_batch)
                 
-                # 2. Вычисляем x_{t-1} (используя вашу математику DDIM)
-                # (Переводим alpha_bar в нужную размерность)
                 s_t_batch = signal_amount_t.view(-1, 1, 1, 1)
                 n_t_batch = noise_amount_t.view(-1, 1, 1, 1)
                 s_prev_batch = signal_amount_t_prev.view(-1, 1, 1, 1)
@@ -573,7 +552,6 @@ def evaluate_metrics_over_denoising_steps(
                 pred_noise_batch = (x_gen_batch - s_t_batch * pred_x0_batch) / (n_t_batch + 1e-8)
                 x_gen_next_batch = s_prev_batch * pred_x0_batch + n_prev_batch * pred_noise_batch
                 
-                # Сохраняем результаты
                 generated_x0_for_step.append(pred_x0_batch.cpu())
                 generated_x_prev_for_step.append(x_gen_next_batch.cpu())
                 
@@ -663,27 +641,20 @@ def analyze_model_complexity(
                Возвращает -1.0 в случае ошибки thop.
     """
 
-    # --- 0. Настройка устройства и модели ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model.eval() # Важно для анализа, отключает dropout и т.д.
-
-    # Создание фиктивных данных
+    model.eval()
     try:
         dummy_x = torch.randn(batch_size, channels, image_size, image_size).to(device)
         dummy_y = torch.randn(batch_size, conditions_dim).float().to(device)
-        dummy_t = 0  # Пример временного шага (можно использовать torch.randint)
-        
-        # Входы для thop в виде кортежа
+        dummy_t = 0  
         thop_inputs = (dummy_x, dummy_t, dummy_y)
     except Exception as e:
         print(f"Ошибка при создании фиктивных тензоров: {e}")
         return -1.0
 
-    # --- 1. Общий анализ с помощью thop ---
-    total_gflops_per_batch = -1.0  # Значение по умолчанию в случае ошибки
+    total_gflops_per_batch = -1.0 
     try:
-        # thop_profile может не поддерживать некоторые операции
         macs, params = thop_profile(model, inputs=thop_inputs, verbose=verbose_thop)
         gflops = 2 * macs / 1e9
         total_gflops_per_batch = gflops * n_steps
@@ -704,8 +675,6 @@ def analyze_model_complexity(
             print(f"Не удалось выполнить анализ thop: {e}")
             print("Проверьте, поддерживает ли thop все операции в вашей модели.")
 
-
-    # --- 2. Детальный анализ по слоям с помощью PyTorch Profiler ---
     if print_profiler:
         print("\n" + "="*50)
         print("### 2. ДЕТАЛЬНЫЙ АНАЛИЗ ПРОИЗВОДИТЕЛЬНОСТИ МОДЕЛИ ###")
