@@ -61,36 +61,47 @@ def sample(
         y_conditions: torch.Tensor,
         n_steps: int,
         device: str,
-        noise_scheduler_fn: Callable,  
+        noise_scheduler_fn: Callable,
         shape: tuple = (1, 30, 30),
-        sampling_method: str = "ddim"  
+        sampling_method: str = "ddim",
+        cache_interval: int = 1  
 ) -> torch.Tensor:
-    """
-    Функция для генерации изображений (инференса) - ИСПРАВЛЕННАЯ
-    Добавлен метод 'ddim', который корректно работает с scheduler'ом
-    """
+
     n_samples = y_conditions.shape[0]
 
     x_gen = torch.randn(n_samples, *shape).to(device)
     y_conditions = y_conditions.to(device)
 
     model.eval()
+    cached_pred_x0 = None 
+
     with torch.no_grad():
         if sampling_method == "ddim":
-            for i in tqdm(reversed(range(n_steps)), desc="Sampling (DDIM)", total=n_steps, leave=False):
-                t_tensor = torch.full((n_samples,), i, device=device, dtype=torch.long)
-                pred_x0 = model(x_gen, t_tensor, y_conditions)
-                t_float = t_tensor.float()
+            for i in tqdm(reversed(range(n_steps)), desc=f"Sampling (DDIM, Cache={cache_interval})", total=n_steps, leave=False):
+                
+                steps_done = (n_steps - 1) - i
+                if cached_pred_x0 is None or steps_done % cache_interval == 0:
+                    t_tensor = torch.full((n_samples,), i, device=device, dtype=torch.long)
+                    pred_x0 = model(x_gen, t_tensor, y_conditions)
+                    cached_pred_x0 = pred_x0 
+                else:
+                    pred_x0 = cached_pred_x0
+
+                t_float = torch.full((n_samples,), i, device=device, dtype=torch.float) 
+                
                 noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
                 signal_amount_t = 1.0 - noise_amount_t
+                
                 t_prev_float = (t_float - 1).clamp(min=0)
                 noise_amount_t_prev = noise_scheduler_fn(t_prev_float, n_steps).view(-1, 1, 1, 1)
                 signal_amount_t_prev = 1.0 - noise_amount_t_prev
+                
                 pred_noise = (x_gen - signal_amount_t * pred_x0) / (noise_amount_t + 1e-8)
+                
                 x_gen = signal_amount_t_prev * pred_x0 + noise_amount_t_prev * pred_noise
 
         elif sampling_method == "default":
-            print("Warning: Используется 'default' сэмплинг, который не связан с noise_scheduler'ом.")
+            print("Warning: Метод 'default' не поддерживает Caching в данной реализации.")
             for i in tqdm(range(n_steps), desc="Sampling (Default)", leave=False):
                 t = torch.full((n_samples,), i, device=device, dtype=torch.long)
                 pred = model(x_gen, t, y_conditions)
@@ -246,19 +257,23 @@ def inference_with_saving(
     device: str,
     noise_scheduler_name: str = "cosine",     
     output_path: str = "generated_data.npz",
-    sampling_method: str = "ddim"      
+    sampling_method: str = "ddim",
+    cache_interval: int = 1  
 ):
-    """
-    Проводит инференс на всем даталоадере и сохраняет результаты в .npz файл.
-    """
 
-    noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
+    if 'NOISE_SCHEDULERS' in globals():
+         noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
+    else:
+         raise ValueError("Не найден словарь NOISE_SCHEDULERS")
+
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
 
     all_real_images, all_gen_images, all_conditions = [], [], []
     model.to(device)
     model.eval()
+
+    print(f"Start Inference: Steps={n_steps}, Cache Interval={cache_interval} (Speedup ~{cache_interval}x)")
 
     with torch.no_grad(): 
         for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
@@ -267,9 +282,10 @@ def inference_with_saving(
                 y_cond, 
                 n_steps, 
                 device,
-                noise_scheduler_fn,          
+                noise_scheduler_fn,           
                 shape=x_real.shape[1:],
-                sampling_method=sampling_method
+                sampling_method=sampling_method,
+                cache_interval=cache_interval 
             )
             
             all_real_images.append(x_real.cpu().numpy())
