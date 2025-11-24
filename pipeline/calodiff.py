@@ -64,22 +64,26 @@ def sample(
         noise_scheduler_fn: Callable,
         shape: tuple = (1, 30, 30),
         sampling_method: str = "ddim",
-        cache_interval: int = 1  
+        cache_interval: int = 1,
+        return_all_steps: bool = False # <--- НОВЫЙ АРГУМЕНТ
 ) -> torch.Tensor:
 
     n_samples = y_conditions.shape[0]
-
     x_gen = torch.randn(n_samples, *shape).to(device)
     y_conditions = y_conditions.to(device)
 
     model.eval()
     cached_pred_x0 = None 
+    
+    history = [] 
 
     with torch.no_grad():
         if sampling_method == "ddim":
-            for i in tqdm(reversed(range(n_steps)), desc=f"Sampling (DDIM, Cache={cache_interval})", total=n_steps, leave=False):
-                
+            iterator = reversed(range(n_steps))
+            
+            for i in iterator:
                 steps_done = (n_steps - 1) - i
+                
                 if cached_pred_x0 is None or steps_done % cache_interval == 0:
                     t_tensor = torch.full((n_samples,), i, device=device, dtype=torch.long)
                     pred_x0 = model(x_gen, t_tensor, y_conditions)
@@ -88,7 +92,6 @@ def sample(
                     pred_x0 = cached_pred_x0
 
                 t_float = torch.full((n_samples,), i, device=device, dtype=torch.float) 
-                
                 noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
                 signal_amount_t = 1.0 - noise_amount_t
                 
@@ -97,20 +100,27 @@ def sample(
                 signal_amount_t_prev = 1.0 - noise_amount_t_prev
                 
                 pred_noise = (x_gen - signal_amount_t * pred_x0) / (noise_amount_t + 1e-8)
-                
                 x_gen = signal_amount_t_prev * pred_x0 + noise_amount_t_prev * pred_noise
+                
+                if return_all_steps:
+                    history.append(x_gen.cpu())
 
         elif sampling_method == "default":
-            print("Warning: Метод 'default' не поддерживает Caching в данной реализации.")
-            for i in tqdm(range(n_steps), desc="Sampling (Default)", leave=False):
+            for i in range(n_steps):
                 t = torch.full((n_samples,), i, device=device, dtype=torch.long)
                 pred = model(x_gen, t, y_conditions)
                 mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
                 x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
+                
+                if return_all_steps:
+                    history.append(x_gen.cpu())
         else:
             raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
 
-    return x_gen.cpu()
+    if return_all_steps:
+        return torch.stack(history, dim=1)
+    else:
+        return x_gen.cpu()
     
 def train(
     model: torch.nn.Module,
@@ -252,15 +262,15 @@ def train(
 
 def inference_with_saving(
     model: torch.nn.Module,
-    dataloader: DataLoader,
+    dataloader: torch.utils.data.DataLoader,
     n_steps: int,
     device: str,
     noise_scheduler_name: str = "cosine",     
     output_path: str = "generated_data.npz",
     sampling_method: str = "ddim",
-    cache_interval: int = 1  
+    cache_interval: int = 1,
+    save_all_steps: bool = False  
 ):
-
     if 'NOISE_SCHEDULERS' in globals():
          noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
     else:
@@ -269,47 +279,67 @@ def inference_with_saving(
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
 
-    all_real_images, all_gen_images, all_conditions = [], [], []
+    all_real_images = []
+    all_gen_images = [] 
+    all_conditions = []
+    
     model.to(device)
     model.eval()
 
-    print(f"Start Inference: Steps={n_steps}, Cache Interval={cache_interval} (Speedup ~{cache_interval}x)")
+    print(f"Start Inference: Steps={n_steps}, Cache Interval={cache_interval}, Save All Steps={save_all_steps}")
 
     with torch.no_grad(): 
         for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
+
             x_gen = sample(
                 model, 
                 y_cond, 
                 n_steps, 
                 device,
-                noise_scheduler_fn,           
+                noise_scheduler_fn,            
                 shape=x_real.shape[1:],
                 sampling_method=sampling_method,
-                cache_interval=cache_interval 
+                cache_interval=cache_interval,
+                return_all_steps=save_all_steps 
             )
             
             all_real_images.append(x_real.cpu().numpy())
             all_gen_images.append(x_gen.cpu().numpy())
             all_conditions.append(y_cond.cpu().numpy())
 
-    real_images_np = np.vstack(all_real_images)
-    gen_images_np = np.vstack(all_gen_images)
-    conditions_np = np.vstack(all_conditions)
+    real_images_np = np.concatenate(all_real_images, axis=0)
+    gen_images_np = np.concatenate(all_gen_images, axis=0) 
+    conditions_np = np.concatenate(all_conditions, axis=0)
 
-    real_labels = np.ones(len(real_images_np))
-    gen_labels = np.zeros(len(gen_images_np))
+    if save_all_steps:
+        final_gen_only = gen_images_np[:, -1, ...] 
+        
+        np.savez_compressed(
+            output_path,
+            real_images=real_images_np,           # Исходные картинки
+            gen_images_history=gen_images_np,     # Вся история генерации
+            gen_images_final=final_gen_only,      # Только результат
+            conditions=conditions_np,
+            labels=np.zeros(len(gen_images_np))   # Метка (если нужна)
+        )
+        print(f"Данные с историей шагов сохранены в: '{output_path}'")
+        print(f"Размерность истории: {gen_images_np.shape}")
 
-    final_images = np.vstack([real_images_np, gen_images_np])
-    final_labels = np.hstack([real_labels, gen_labels])
-    final_conditions = np.vstack([conditions_np, conditions_np])
+    else:
+        real_labels = np.ones(len(real_images_np))
+        gen_labels = np.zeros(len(gen_images_np))
 
-    np.savez_compressed(
-        output_path,
-        images=final_images,
-        labels=final_labels,
-        conditions=final_conditions
-    )
-    print(f"Данные успешно сохранены в файл: '{output_path}'")
+        final_images = np.concatenate([real_images_np, gen_images_np], axis=0)
+        final_labels = np.concatenate([real_labels, gen_labels], axis=0)
+        final_conditions = np.concatenate([conditions_np, conditions_np], axis=0)
+
+        np.savez_compressed(
+            output_path,
+            images=final_images,
+            labels=final_labels,
+            conditions=final_conditions
+        )
+        print(f"Данные (только финал) сохранены в: '{output_path}'")
 
 
 def _calculate_physics_metrics(
