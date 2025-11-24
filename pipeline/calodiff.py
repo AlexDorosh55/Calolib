@@ -65,7 +65,8 @@ def sample(
         shape: tuple = (1, 30, 30),
         sampling_method: str = "ddim",
         cache_interval: int = 1,
-        return_all_steps: bool = False # <--- НОВЫЙ АРГУМЕНТ
+        return_all_steps: bool = False,
+        specific_steps: Optional[List[int]] = None # <--- НОВЫЙ АРГУМЕНТ
 ) -> torch.Tensor:
 
     n_samples = y_conditions.shape[0]
@@ -79,7 +80,10 @@ def sample(
 
     with torch.no_grad():
         if sampling_method == "ddim":
-            iterator = reversed(range(n_steps))
+            if specific_steps is not None:
+                iterator = specific_steps
+            else:
+                iterator = reversed(range(n_steps))
             
             for i in iterator:
                 steps_done = (n_steps - 1) - i
@@ -106,9 +110,15 @@ def sample(
                     history.append(x_gen.cpu())
 
         elif sampling_method == "default":
-            for i in range(n_steps):
+            if specific_steps is not None:
+                iterator = specific_steps
+            else:
+                iterator = range(n_steps)
+
+            for i in iterator:
                 t = torch.full((n_samples,), i, device=device, dtype=torch.long)
                 pred = model(x_gen, t, y_conditions)
+                
                 mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
                 x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
                 
@@ -269,12 +279,13 @@ def inference_with_saving(
     output_path: str = "generated_data.npz",
     sampling_method: str = "ddim",
     cache_interval: int = 1,
-    save_all_steps: bool = False  
+    save_all_steps: bool = False,
+    specific_steps: Optional[List[int]] = None
 ):
     if 'NOISE_SCHEDULERS' in globals():
          noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
     else:
-         raise ValueError("Не найден словарь NOISE_SCHEDULERS")
+         pass 
 
     if not noise_scheduler_fn:
         raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
@@ -286,7 +297,7 @@ def inference_with_saving(
     model.to(device)
     model.eval()
 
-    print(f"Start Inference: Steps={n_steps}, Cache Interval={cache_interval}, Save All Steps={save_all_steps}")
+    print(f"Start Inference: Steps={n_steps}, Specific Steps={specific_steps}, Save All={save_all_steps}")
 
     with torch.no_grad(): 
         for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
@@ -300,7 +311,8 @@ def inference_with_saving(
                 shape=x_real.shape[1:],
                 sampling_method=sampling_method,
                 cache_interval=cache_interval,
-                return_all_steps=save_all_steps 
+                return_all_steps=save_all_steps,
+                specific_steps=specific_steps
             )
             
             all_real_images.append(x_real.cpu().numpy())
@@ -316,11 +328,11 @@ def inference_with_saving(
         
         np.savez_compressed(
             output_path,
-            real_images=real_images_np,           # Исходные картинки
-            gen_images_history=gen_images_np,     # Вся история генерации
-            gen_images_final=final_gen_only,      # Только результат
+            real_images=real_images_np,
+            gen_images_history=gen_images_np,
+            gen_images_final=final_gen_only,
             conditions=conditions_np,
-            labels=np.zeros(len(gen_images_np))   # Метка (если нужна)
+            labels=np.zeros(len(gen_images_np))
         )
         print(f"Данные с историей шагов сохранены в: '{output_path}'")
         print(f"Размерность истории: {gen_images_np.shape}")
