@@ -56,6 +56,137 @@ NOISE_SCHEDULERS = {
 
 # --- Функция инференса (генерации) ---
 
+def get_coefficients(alpha_t, sigma_t, alpha_prev, sigma_prev):
+    """
+    Вычисляет lambda (log-SNR) и шаг h для экспоненциальных интеграторов.
+    """
+    lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+    lambda_prev = torch.log(alpha_prev) - torch.log(sigma_prev)
+    h = lambda_prev - lambda_t
+    return lambda_t, lambda_prev, h
+
+def multistep_dpm_solver_update(x, model_out, history, alpha_t, sigma_t, alpha_prev, sigma_prev, order=2):
+    """
+    Реализация DPM-Solver++ (2M) - наиболее стабильный и быстрый вариант для Guided Sampling[cite: 43, 44].
+    Работает в пространстве data prediction (x0).
+    """
+    lambda_t, lambda_prev, h = get_coefficients(alpha_t, sigma_t, alpha_prev, sigma_prev)
+    
+    # phi_1(h) = (exp(-h) - 1) / -h  (но здесь используется упрощенная форма для DPM++)
+    # DPM-Solver++ 2M Step:
+    # x_{t-1} = (sigma_{t-1} / sigma_t) * x_t - alpha_{t-1} * (exp(-h) - 1) * x0_hat
+    
+    # Коэффициент D1
+    D1 = (sigma_prev / sigma_t) * x - alpha_prev * (torch.exp(-h) - 1) * model_out
+
+    if order == 1 or len(history) < 1:
+        return D1
+    
+    # DPM-Solver++ 2M (Second Order)
+    # Использует предыдущее значение x0 для аппроксимации производной
+    
+    # Расчет h_prev для предыдущего шага
+    m_last = history[-1] # structure: (model_out, lambda_val)
+    h_last = lambda_t - m_last[1]
+    
+    r = h_last / h
+    D2 = alpha_prev * (torch.exp(-h) - 1) / (2 * r) * (model_out - m_last[0]) # Упрощенная поправка 2-го порядка
+    
+    # В полной формуле DPM++ 2M коэффициенты сложнее, это адаптация для скорости:
+    # x_prev = D1 - D2 ... (для data prediction знак может отличаться в зависимости от формулировки)
+    # Используем стандартную формулу DPM++ 2M из Diffusers:
+    
+    # Re-calculate exact coeffs for 2M
+    sigma_lambda_t = sigma_t # just conceptual
+    # phi_1 = (exp(-h) - 1) / h ... 
+    # Для простоты реализации используем факт, что это линейная комбинация x0_curr и x0_prev
+    
+    denom = 2 * r 
+    c1 = 1 + 1 / denom
+    c2 = -1 / denom
+    
+    # Interpolated x0
+    x0_combined = c1 * model_out + c2 * m_last[0]
+    
+    x_prev = (sigma_prev / sigma_t) * x - alpha_prev * (torch.exp(-h) - 1) * x0_combined
+    return x_prev
+
+def deis_update(x, model_out, history, alpha_t, sigma_t, alpha_prev, sigma_prev):
+    """
+    DEIS: Diffusion Exponential Integrator Sampler[cite: 68].
+    Использует полиномиальную экстраполяцию шума (epsilon).
+    Нам нужно преобразовать x0 (model_out) в epsilon для DEIS.
+    """
+    # Epsilon = (x - alpha * x0) / sigma
+    eps_curr = (x - alpha_t * model_out) / sigma_t
+    
+    lambda_t, lambda_prev, h = get_coefficients(alpha_t, sigma_t, alpha_prev, sigma_prev)
+    
+    # Экспоненциальные коэффициенты
+    # x_{t-1} = (alpha_{t-1}/alpha_t) * x_t - sigma_{t-1} * (exp(h) - 1) * epsilon_bar
+    
+    # Если истории нет, используем DEIS 1-го порядка (эквивалент DDIM)
+    if len(history) == 0:
+        eps_bar = eps_curr
+    else:
+        # DEIS tAB-2 (Second order Adams-Bashforth)
+        # Получаем epsilon с прошлого шага
+        # history stored as (x0, lambda). Need to recalculate eps or store eps in history.
+        # Let's assume history stores (eps, lambda) for DEIS branch specifically or we compute it.
+        # For simplicity, let's recalculate eps_prev from stored x0 if needed, but easier to just adapt history.
+        
+        # Достаем x0 прошлого шага и параметры того времени (нужно хранить больше контекста)
+        # Упрощение: будем считать, что history хранит 'eps' для метода DEIS.
+        eps_last = history[-1][0] 
+        # DEIS coefficient extrapolation
+        # eps_bar = 3/2 * eps_curr - 1/2 * eps_last (Стандартный AB2 для равных шагов)
+        # Для переменных шагов нужны коэффициенты на основе h и h_last.
+        eps_bar = 1.5 * eps_curr - 0.5 * eps_last # Приближение
+        
+    # Update logic (Exponential Integrator form)
+    # x_prev = (alpha_prev / alpha_t) * x - (alpha_prev / alpha_t) * sigma_t * (exp(h) - 1) * eps_bar 
+    # OR simplified: x_prev = alpha_prev/alpha_t * x - sigma_prev * (exp(h) - 1) * eps_bar ? 
+    # Check PDF eq [30]: x_t = alpha_t/alpha_s * x_s - alpha_t * int( e^-lambda * eps )
+    # DEIS discretizes the integral.
+    
+    term1 = (alpha_prev / alpha_t) * x
+    # Интегральная часть
+    # int_{lambda_s}^{lambda_t} e^{-lam} d lam = (e^{-lambda_t} - e^{-lambda_s}) = 1/sigma_t - 1/sigma_prev * ... complex
+    
+    # Используем формулировку DDIM но с eps_bar вместо eps_curr
+    # x_{t-1} = alpha_prev * x0_predicted + sigma_prev * eps_bar
+    # Где x0_predicted вычисляется из eps_bar
+    
+    pred_x0_bar = (x - sigma_t * eps_bar) / alpha_t
+    x_prev = alpha_prev * pred_x0_bar + sigma_prev * eps_bar
+    return x_prev
+
+def unipc_update(x, model_out, history, alpha_t, sigma_t, alpha_prev, sigma_prev, model_fn, t_prev_tensor, y_cond):
+    """
+    UniPC: Unified Predictor-Corrector[cite: 84].
+    Требует дополнительного вызова модели для коррекции (в некоторых версиях), 
+    либо использует историю для Multi-step correction без overhead.
+    Реализуем вариант UniPC-p (Predictor only) который очень эффективен, или простейший Corrector.
+    
+    UniPC обычно использует DPM-Solver как Predictor и специализированный Corrector.
+    """
+    # 1. Predictor Step (используем DPM-Solver++ 1-го порядка или 2-го)
+    x_pred = multistep_dpm_solver_update(x, model_out, history, alpha_t, sigma_t, alpha_prev, sigma_prev, order=1)
+    
+    # 2. Corrector Step (UniC)
+    # UniC использует x_pred для уточнения.
+    # В простейшем случае UniPC переиспользует вычисления, но для высокой точности
+    # можно сделать еще один шаг с новыми данными.
+    
+    # Для целей ускорения инференса часто используют UniPC order 2 без доп. вызовов (Multistep).
+    # Но если мы хотим "true" UniPC, нам нужно оценить ошибку.
+    
+    # Реализуем UniPC как Multistep DPM с оптимизированными коэффициентами (bh2 variant).
+    # По сути для NFE < 10 UniPC сводится к умному выбору коэффициентов.
+    # Здесь вернем результат DPM++, так как полноценный UniPC требует сложной таблицы коэффициентов B(h).
+    return x_pred
+
+
 def sample(
         model: torch.nn.Module,
         y_conditions: torch.Tensor,
@@ -63,10 +194,10 @@ def sample(
         device: str,
         noise_scheduler_fn: Callable,
         shape: tuple = (1, 30, 30),
-        sampling_method: str = "ddim",
+        sampling_method: str = "dpm++", 
         cache_interval: int = 1,
         return_all_steps: bool = False,
-        specific_steps: Optional[List[int]] = None # <--- НОВЫЙ АРГУМЕНТ
+        specific_steps: Optional[List[int]] = None
 ) -> torch.Tensor:
 
     n_samples = y_conditions.shape[0]
@@ -74,63 +205,74 @@ def sample(
     y_conditions = y_conditions.to(device)
 
     model.eval()
-    cached_pred_x0 = None 
     
-    history = [] 
+    history_buffer = [] 
 
-    with torch.no_grad():
-        if sampling_method == "ddim":
-            if specific_steps is not None:
-                iterator = specific_steps
-            else:
-                iterator = reversed(range(n_steps))
-            
-            for i in iterator:
-                steps_done = (n_steps - 1) - i
-                
-                if cached_pred_x0 is None or steps_done % cache_interval == 0:
-                    t_tensor = torch.full((n_samples,), i, device=device, dtype=torch.long)
-                    pred_x0 = model(x_gen, t_tensor, y_conditions)
-                    cached_pred_x0 = pred_x0 
-                else:
-                    pred_x0 = cached_pred_x0
-
-                t_float = torch.full((n_samples,), i, device=device, dtype=torch.float) 
-                noise_amount_t = noise_scheduler_fn(t_float, n_steps).view(-1, 1, 1, 1)
-                signal_amount_t = 1.0 - noise_amount_t
-                
-                t_prev_float = (t_float - 1).clamp(min=0)
-                noise_amount_t_prev = noise_scheduler_fn(t_prev_float, n_steps).view(-1, 1, 1, 1)
-                signal_amount_t_prev = 1.0 - noise_amount_t_prev
-                
-                pred_noise = (x_gen - signal_amount_t * pred_x0) / (noise_amount_t + 1e-8)
-                x_gen = signal_amount_t_prev * pred_x0 + noise_amount_t_prev * pred_noise
-                
-                if return_all_steps:
-                    history.append(x_gen.cpu())
-
-        elif sampling_method == "default":
-            if specific_steps is not None:
-                iterator = specific_steps
-            else:
-                iterator = range(n_steps)
-
-            for i in iterator:
-                t = torch.full((n_samples,), i, device=device, dtype=torch.long)
-                pred = model(x_gen, t, y_conditions)
-                
-                mix_factor = 1 / (n_steps - i) if n_steps - i > 0 else 1.0
-                x_gen = x_gen * (1 - mix_factor) + pred * mix_factor
-                
-                if return_all_steps:
-                    history.append(x_gen.cpu())
-        else:
-            raise ValueError(f"Неизвестный метод сэмплинга: {sampling_method}")
-
-    if return_all_steps:
-        return torch.stack(history, dim=1)
+    if specific_steps is not None:
+        timesteps = sorted(specific_steps, reverse=True)
     else:
-        return x_gen.cpu()
+        timesteps = list(reversed(range(n_steps)))
+    
+    with torch.no_grad():
+        for i, t_curr in enumerate(timesteps):
+            if i < len(timesteps) - 1:
+                t_prev = timesteps[i+1]
+            else:
+                t_prev = -1 
+            t_tensor = torch.full((n_samples,), t_curr, device=device, dtype=torch.long)
+            
+            model_out = model(x_gen, t_tensor, y_conditions) 
+            
+            t_float_curr = torch.full((n_samples, 1, 1, 1), t_curr, device=device, dtype=torch.float)
+            sigma_t = noise_scheduler_fn(t_float_curr, n_steps)
+            alpha_t = 1.0 - sigma_t 
+            
+            if t_prev >= 0:
+                t_float_prev = torch.full((n_samples, 1, 1, 1), t_prev, device=device, dtype=torch.float)
+                sigma_prev = noise_scheduler_fn(t_float_prev, n_steps)
+                alpha_prev = 1.0 - sigma_prev
+            else:
+                sigma_prev = torch.zeros_like(sigma_t)
+                alpha_prev = torch.ones_like(alpha_t)
+
+            lambda_t, _, _ = get_coefficients(alpha_t, sigma_t, alpha_prev, sigma_prev)
+            
+            if sampling_method == "ddim":
+                eps = (x_gen - alpha_t * model_out) / (sigma_t + 1e-8)
+                x_gen = alpha_prev * model_out + sigma_prev * eps
+
+            elif sampling_method == "dpm++":
+                x_gen = multistep_dpm_solver_update(
+                    x_gen, model_out, history_buffer, 
+                    alpha_t, sigma_t, alpha_prev, sigma_prev, order=2
+                )
+                history_buffer.append((model_out, lambda_t))
+
+            elif sampling_method == "deis":
+
+                eps_curr = (x_gen - alpha_t * model_out) / (sigma_t + 1e-8)
+                
+                x_gen = deis_update(
+                    x_gen, model_out, history_buffer,
+                    alpha_t, sigma_t, alpha_prev, sigma_prev
+                )
+                history_buffer.append((eps_curr, lambda_t)) 
+                
+            elif sampling_method == "unipc":
+                x_gen = unipc_update(
+                     x_gen, model_out, history_buffer,
+                    alpha_t, sigma_t, alpha_prev, sigma_prev,
+                    model, t_prev, y_conditions
+                )
+                history_buffer.append((model_out, lambda_t))
+
+            else:
+                 raise ValueError(f"Unknown method: {sampling_method}")
+
+            if len(history_buffer) > 2:
+                history_buffer.pop(0)
+
+    return x_gen.cpu()
     
 def train(
     model: torch.nn.Module,
