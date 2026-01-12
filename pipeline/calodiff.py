@@ -516,9 +516,9 @@ def _calculate_physics_metrics(
     )
 
     metrics.update({
-        'PRD_energy_AUC': np.trapz(precision_energy, recall_energy),
+        'PRD_energy_AUC': np.trapezoid(precision_energy, recall_energy),
         'precision_energy': precision_energy, 'recall_energy': recall_energy,
-        'PRD_physics_AUC': np.trapz(precision_physics, recall_physics),
+        'PRD_physics_AUC': np.trapezoid(precision_physics, recall_physics),
         'precision_physics': precision_physics, 'recall_physics': recall_physics
     })
     
