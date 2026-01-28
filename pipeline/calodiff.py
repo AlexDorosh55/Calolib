@@ -140,6 +140,7 @@ def sample(
         shape: tuple = (1, 30, 30),
         sampling_method: str = "dpm++", 
         cache_interval: int = 1,
+        compute_steps_schedule: Optional[List[int]] = None, # <--- 1. Новый аргумент
         return_all_steps: bool = False,
         specific_steps: Optional[List[int]] = None
 ) -> torch.Tensor:
@@ -150,6 +151,9 @@ def sample(
 
     model.eval()
     history_buffer = [] 
+    
+    # Инициализация кэша
+    cached_model_out = None # <--- 2. Переменная для кэша
 
     if specific_steps is not None:
         timesteps = sorted(specific_steps, reverse=True)
@@ -158,7 +162,7 @@ def sample(
 
     with torch.no_grad():
         for i, t_curr in enumerate(timesteps):
-            # Проверяем, является ли этот шаг последним (переход к чистым данным)
+            # Проверяем, является ли этот шаг последним
             is_last_step = (i == len(timesteps) - 1)
             
             if not is_last_step:
@@ -166,10 +170,33 @@ def sample(
             else:
                 t_prev = -1 
             
-            t_tensor = torch.full((n_samples,), t_curr, device=device, dtype=torch.long)
-            model_out = model(x_gen, t_tensor, y_conditions) 
+            # --- 3. Логика решения: Вычислять или Кэшировать? ---
+            should_compute = False
+
+            # Всегда вычисляем на самом первом шаге, чтобы заполнить кэш
+            if i == 0:
+                should_compute = True
+            elif compute_steps_schedule is not None:
+                # Если задан конкретный список шагов, проверяем наличие текущего t в нем
+                if t_curr in compute_steps_schedule:
+                    should_compute = True
+            else:
+                # Иначе используем интервал (старое поведение)
+                if i % cache_interval == 0:
+                    should_compute = True
+
+            # --- Выполнение ---
+            if should_compute:
+                t_tensor = torch.full((n_samples,), t_curr, device=device, dtype=torch.long)
+                model_out = model(x_gen, t_tensor, y_conditions) 
+                cached_model_out = model_out # Обновляем кэш
+            else:
+                # Используем результат с предыдущего вычисления
+                model_out = cached_model_out
+
+            # --- Далее стандартная математика сэмплера (выполняется всегда) ---
             
-            # --- Расчет Alpha/Sigma ---
+            # Расчет Alpha/Sigma
             t_float_curr = torch.full((n_samples, 1, 1, 1), t_curr, device=device, dtype=torch.float)
             sigma_t = noise_scheduler_fn(t_float_curr, n_steps)
             alpha_t = 1.0 - sigma_t 
@@ -179,12 +206,11 @@ def sample(
                 sigma_prev = noise_scheduler_fn(t_float_prev, n_steps)
                 alpha_prev = 1.0 - sigma_prev
             else:
-                # Финальный шаг: sigma -> 0, alpha -> 1
                 sigma_prev = torch.zeros_like(sigma_t)
                 alpha_prev = torch.ones_like(alpha_t)
 
-            # Вычисляем lambda только для записи в историю, 
-            # внутри update она пересчитается безопасно
+            # Вычисляем lambda (для истории DPM++)
+            # Примечание: функция get_coefficients должна быть доступна в контексте
             lambda_t, _, _ = get_coefficients(alpha_t, sigma_t, alpha_prev, sigma_prev)
 
             if sampling_method == "ddim":
@@ -192,7 +218,6 @@ def sample(
                 x_gen = alpha_prev * model_out + sigma_prev * eps
 
             elif sampling_method == "dpm++":
-                # ВАЖНО: Если это последний шаг, принудительно Order=1
                 current_order = 1 if is_last_step else 2
                 
                 x_gen = multistep_dpm_solver_update(
@@ -202,10 +227,7 @@ def sample(
                 history_buffer.append((model_out, lambda_t))
 
             elif sampling_method == "unipc":
-                # UniPC predictor (здесь упрощен до DPM 1-го порядка, если это последний шаг)
-                # Полноценный UniPC требует corrector'а, но DPM++ 1-order работает как predictor
-                current_order = 1 # UniPC часто использует 1-order predictor + corrector
-                # Для простоты используем DPM++ 2M update, но можно ограничить порядок
+                current_order = 1 
                 
                 if is_last_step:
                      x_gen = multistep_dpm_solver_update(x_gen, model_out, [], alpha_t, sigma_t, alpha_prev, sigma_prev, order=1)
