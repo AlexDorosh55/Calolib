@@ -2,7 +2,7 @@
 # === Группа 1: Стандартные библиотеки Python ===
 import os
 import copy
-from typing import Callable, Optional, Dict, List, Tuple
+from typing import Callable, Optional, Dict, List, Tuple, Union
 
 # === Группа 2: Сторонние библиотеки (Third-Party) ===
 
@@ -366,10 +366,12 @@ def inference_with_saving(
     noise_scheduler_name: str = "cosine",     
     output_path: str = "generated_data.npz",
     sampling_method: str = "ddim",
-    cache_interval: int = 1,
+    cache_interval: int = 1,  # Оставляем для совместимости
+    compute_steps_schedule: Optional[List[int]] = None, # <--- НОВЫЙ ПАРАМЕТР
     save_all_steps: bool = False,
     specific_steps: Optional[List[int]] = None
 ):
+    # Проверка наличия scheduler (как в оригинале)
     if 'NOISE_SCHEDULERS' in globals():
          noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
     else:
@@ -385,20 +387,29 @@ def inference_with_saving(
     model.to(device)
     model.eval()
 
-    print(f"Start Inference: Steps={n_steps}, Specific Steps={specific_steps}, Save All={save_all_steps}")
+    # Логирование режима работы
+    if compute_steps_schedule is not None:
+        mode_msg = f"Custom Schedule: {compute_steps_schedule}"
+    else:
+        mode_msg = f"Interval: {cache_interval}"
+
+    print(f"Start Inference: Steps={n_steps}, Mode={mode_msg}, Save All={save_all_steps}")
 
     with torch.no_grad(): 
         for x_real, y_cond in tqdm(dataloader, desc="Inference and Saving"):
 
+            # Передаем новый параметр в функцию sample
+            # ПРИМЕЧАНИЕ: Функция sample должна быть обновлена, чтобы принимать этот аргумент!
             x_gen = sample(
                 model, 
                 y_cond, 
                 n_steps, 
                 device,
-                noise_scheduler_fn,            
+                noise_scheduler_fn,              
                 shape=x_real.shape[1:],
                 sampling_method=sampling_method,
                 cache_interval=cache_interval,
+                compute_steps_schedule=compute_steps_schedule, # <--- Передаем список дальше
                 return_all_steps=save_all_steps,
                 specific_steps=specific_steps
             )
@@ -411,6 +422,7 @@ def inference_with_saving(
     gen_images_np = np.concatenate(all_gen_images, axis=0) 
     conditions_np = np.concatenate(all_conditions, axis=0)
 
+    # --- Блок сохранения (без изменений) ---
     if save_all_steps:
         final_gen_only = gen_images_np[:, -1, ...] 
         
