@@ -680,7 +680,7 @@ def evaluate_metrics_with_frozen_guidance(
     metrics_history = {
         'step': [], 'timestep': [], 
         'PRD_energy_AUC': [], 'PRD_physics_AUC': [],
-        # ... остальные ключи
+        'PRD_energy_AUC_std': [], 'PRD_physics_AUC_std': []
     }
 
     # Подготовка реальных данных для сравнения
