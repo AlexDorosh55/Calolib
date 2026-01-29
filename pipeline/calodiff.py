@@ -639,124 +639,137 @@ def calculate_pr_metrics(precisions: List[np.ndarray], recalls: List[np.ndarray]
 
     return np.mean(pr_aucs), std_pr_aucs
 
-def evaluate_metrics_over_denoising_steps(
+def evaluate_metrics_with_frozen_guidance(
     model: torch.nn.Module,
     dataloader: DataLoader,
-    n_steps: int,                      
-    t_train_max: int,                  
+    n_steps: int,                    # Например, 100
+    t_train_max: int,                # Например, 1000
     device: str,
+    unet_update_freq: int = 10,      # <--- НОВЫЙ ПАРАМЕТР: обновляем Unet каждые 10 шагов
     denoising_scheduler_name: str = "cosine",
     initial_noise: Optional[torch.Tensor] = None,
     apply_expm1: bool = True
 ) -> Dict[str, List[float]]:
-    """
-    Проводит оценку метрик на каждом шаге, используя кастомную 
-    реализацию DDIM и правильное масштабирование временных шагов.
-    """
     
+    # ... (инициализация scheduler, x_gen_cpu, real_images_eval как раньше) ...
     noise_scheduler_fn = NOISE_SCHEDULERS.get(denoising_scheduler_name)
-    if not noise_scheduler_fn:
-        raise ValueError(f"Неизвестный scheduler шума: {denoising_scheduler_name}")
-        
     model.to(device)
     model.eval()
-    
+
+    # Подготовка данных (как было у тебя)
     all_x_real = []
     all_y_conditions = []
-    for x_real_batch, y_conditions_batch in dataloader:
-        all_x_real.append(x_real_batch)
-        all_y_conditions.append(y_conditions_batch)
-
-    if not all_x_real:
-        print("Ошибка: dataloader пуст.")
-        return {}
-        
+    for x_b, y_b in dataloader:
+        all_x_real.append(x_b)
+        all_y_conditions.append(y_b)
     x_real_cpu = torch.cat(all_x_real, dim=0)
     y_conditions_cpu = torch.cat(all_y_conditions, dim=0)
     
-    n_samples = y_conditions_cpu.shape[0]
-    shape = x_real_cpu.shape[1:]
-
     if initial_noise is None:
-        x_gen_cpu = torch.randn(n_samples, *shape)
+        x_gen_cpu = torch.randn_like(x_real_cpu)
     else:
         x_gen_cpu = initial_noise.clone()
 
-    batch_size = dataloader.batch_size or n_samples
+    batch_size = dataloader.batch_size or len(x_real_cpu)
+    n_samples = len(x_real_cpu)
+
+    # Словарь для кэширования предсказаний модели (чтобы использовать их N раз)
+    # Ключ: индекс батча (j), Значение: тензор pred_x0
+    cached_predictions = {} 
 
     metrics_history = {
         'step': [], 'timestep': [], 
         'PRD_energy_AUC': [], 'PRD_physics_AUC': [],
-        'PRD_energy_AUC_std': [], 'PRD_physics_AUC_std': []
+        # ... остальные ключи
     }
 
+    # Подготовка реальных данных для сравнения
     if apply_expm1:
         real_images_eval = torch.expm1(x_real_cpu)
     else:
         real_images_eval = x_real_cpu
-    
     real_images_np = real_images_eval.cpu().numpy()
-    del real_images_eval 
     conditions_np = y_conditions_cpu.numpy()
 
-    with torch.no_grad():
+    print(f"Запуск: шагов {n_steps}, обновление Unet каждые {unet_update_freq} шагов.")
 
-        for i in tqdm(reversed(range(n_steps + 1)), desc="Evaluating Denoising Steps", total=n_steps + 1):
+    with torch.no_grad():
+        # Идем от 100 до 0
+        for i in tqdm(reversed(range(n_steps + 1)), desc="Evaluating", total=n_steps + 1):
             
-            generated_x0_for_step = []
-            generated_x_prev_for_step = []
+            # Расчет времени t (текущее) и t_prev (следующее)
             t_val = torch.floor(torch.tensor(i) * (t_train_max / n_steps)).long()
-            
             t_prev_val = torch.floor(torch.tensor(i - 1) * (t_train_max / n_steps)).clamp(min=0).long()
             
+            # Коэффициенты шума для шедулера
             noise_amount_t = noise_scheduler_fn(t_val.float(), t_train_max).to(device)
             signal_amount_t = 1.0 - noise_amount_t
-            
             noise_amount_t_prev = noise_scheduler_fn(t_prev_val.float(), t_train_max).to(device)
             signal_amount_t_prev = 1.0 - noise_amount_t_prev
+
+            # === ЛОГИКА "ЗАМОРОЗКИ" ===
+            # Мы запускаем тяжелый model() только если шаг кратен частоте обновления
+            # ИЛИ если это самый первый шаг (чтобы инициализировать кэш)
+            should_update_unet = (i % unet_update_freq == 0) or (i == n_steps)
+
+            generated_x0_for_step = []     # Для метрик
+            generated_x_prev_for_step = [] # Для следующего шага
 
             for j in range(0, n_samples, batch_size):
                 x_gen_batch = x_gen_cpu[j:j+batch_size].to(device)
                 y_conditions_batch = y_conditions_cpu[j:j+batch_size].to(device)
                 
+                # 1. ПОЛУЧЕНИЕ PRED_X0 (Свежее или из кэша)
+                if should_update_unet:
+                    t_tensor_batch = torch.full((x_gen_batch.shape[0],), t_val.item(), device=device, dtype=torch.long)
+                    # !!! ТЯЖЕЛАЯ ОПЕРАЦИЯ !!!
+                    pred_x0_batch = model(x_gen_batch, t_tensor_batch, y_conditions_batch)
+                    # Сохраняем в кэш
+                    cached_predictions[j] = pred_x0_batch
+                else:
+                    # !!! БЕРЕМ ИЗ КЭША (бесплатно) !!!
+                    # Важно: мы применяем СТАРОЕ предсказание к НОВОМУ зашумленному x_gen_batch
+                    pred_x0_batch = cached_predictions[j]
 
-                t_tensor_batch = torch.full((x_gen_batch.shape[0],), t_val.item(), device=device, dtype=torch.long)
-                
-                pred_x0_batch = model(x_gen_batch, t_tensor_batch, y_conditions_batch)
-                
+                # 2. ШАГ ШЕДУЛЕРА (DDIM Math)
+                # Математика выполняется ВСЕГДА, чтобы физически уменьшить шум в картинке
                 s_t_batch = signal_amount_t.view(-1, 1, 1, 1)
                 n_t_batch = noise_amount_t.view(-1, 1, 1, 1)
                 s_prev_batch = signal_amount_t_prev.view(-1, 1, 1, 1)
                 n_prev_batch = noise_amount_t_prev.view(-1, 1, 1, 1)
 
+                # Вычисляем "направление шума" на основе (текущего x) и (предсказанного x0)
                 pred_noise_batch = (x_gen_batch - s_t_batch * pred_x0_batch) / (n_t_batch + 1e-8)
+                
+                # Делаем шаг в сторону чистого изображения
                 x_gen_next_batch = s_prev_batch * pred_x0_batch + n_prev_batch * pred_noise_batch
                 
                 generated_x0_for_step.append(pred_x0_batch.cpu())
                 generated_x_prev_for_step.append(x_gen_next_batch.cpu())
-                
-                del x_gen_batch, y_conditions_batch, pred_x0_batch, x_gen_next_batch, t_tensor_batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+
+            # Обновляем x_gen для следующего цикла
             x_gen_cpu = torch.cat(generated_x_prev_for_step, dim=0)
+
+            # 3. РАСЧЕТ МЕТРИК (На КАЖДОМ шаге)
+            # Мы хотим видеть график, поэтому считаем метрики всегда
             pred_x0_cpu_all = torch.cat(generated_x0_for_step, dim=0)
-            
             gen_images_eval = torch.maximum(pred_x0_cpu_all, torch.tensor(0.))
             if apply_expm1:
                 gen_images_eval = torch.expm1(gen_images_eval)
-
             gen_images_np = gen_images_eval.cpu().numpy()
+
             current_metrics = _calculate_physics_metrics(gen_images_np, real_images_np, conditions_np)
             
+            # Логируем
             metrics_history['step'].append(i) 
             metrics_history['timestep'].append(t_val.item())
             
-
-            current_prd_auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
-            current_prd_auc_physics, current_prd_auc_physics_std = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
+            # ... (твоя логика AUC) ...
+            auc_energy, _ = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
+            auc_physics, _ = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
             
-            metrics_history['PRD_energy_AUC'].append(current_prd_auc_energy)
-            metrics_history['PRD_physics_AUC'].append(current_prd_auc_physics)
+            metrics_history['PRD_energy_AUC'].append(auc_energy)
+            metrics_history['PRD_physics_AUC'].append(auc_physics)
             metrics_history['PRD_energy_AUC_std'].append(current_prd_auc_energy_std)
             metrics_history['PRD_physics_AUC_std'].append(current_prd_auc_physics_std)
 
