@@ -765,8 +765,8 @@ def evaluate_metrics_with_frozen_guidance(
             metrics_history['timestep'].append(t_val.item())
             
             # ... (твоя логика AUC) ...
-            auc_energy, _ = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
-            auc_physics, _ = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
+            auc_energy, current_prd_auc_energy_std = calculate_pr_metrics(current_metrics['precision_energy'], current_metrics['recall_energy'])
+            auc_physics, current_prd_auc_physics_std = calculate_pr_metrics(current_metrics['precision_physics'], current_metrics['recall_physics'])
             
             metrics_history['PRD_energy_AUC'].append(auc_energy)
             metrics_history['PRD_physics_AUC'].append(auc_physics)
