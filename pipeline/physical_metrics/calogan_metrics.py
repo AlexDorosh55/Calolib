@@ -1,101 +1,157 @@
 # Taken from: https://github.com/SchattenGenie/mlhep2019_2_phase/blob/master/analysis/calogan_metrics.py
 import numpy as np
+from numba import njit
 
-
-def get_assymetry(imgs, ps, points, orthog=False):
-    assym_res = []
-    zoff = 25
+@njit
+def get_assymmetry(imgs, ps, points, orthog=False):
+    n_imgs = imgs.shape[0]
+    assym_res = np.zeros(n_imgs)
+    zoff = 25.0
     
-    x = np.linspace(-14.5, 14.5, 30)
-    y = np.linspace(-14.5, 14.5, 30)
-    xx, yy = np.meshgrid(x, y)
-    xx = np.repeat(xx[np.newaxis, ...], len(imgs), axis=0)
-    yy = np.repeat(yy[np.newaxis, ...], len(imgs), axis=0)
+    # Сетка от -14.5 до 14.5 (30 шагов)
+    grid_coords = np.linspace(-14.5, 14.5, 30)
     
-    points_0 = points[:, 0] + zoff * ps[:, 0] / ps[:, 2]
-    points_1 = points[:, 1] + zoff * ps[:, 1] / ps[:, 2]
-    if orthog:
-        line_func = lambda x: (x - points_0[..., np.newaxis, np.newaxis]) / (ps[:, 0] / ps[:, 1])[..., np.newaxis, np.newaxis] + points_1[..., np.newaxis, np.newaxis]
-    else:
-        line_func = lambda x: -(x - points_0[..., np.newaxis, np.newaxis]) / (ps[:, 1] / ps[:, 0])[..., np.newaxis, np.newaxis] + points_1[..., np.newaxis, np.newaxis]
-
-    sign = np.ones(len(ps))
-    if not orthog:
-        sign = (ps[:, 1] > 0).astype(int)
-        sign = 2 * (sign - 0.5)
-    
-    idx = np.where((yy - line_func(xx)) * sign[..., np.newaxis, np.newaxis] < 0)        
-    zz = np.ones((len(imgs), 30, 30))
-    zz[idx] = 0
-    assym = (np.sum(imgs * zz, axis=(1, 2)) - 
-             np.sum(imgs * (1 - zz), axis=(1, 2))) / np.sum(imgs, axis=(1, 2))
+    for k in range(n_imgs):
+        p0 = points[k, 0] + zoff * ps[k, 0] / ps[k, 2]
+        p1 = points[k, 1] + zoff * ps[k, 1] / ps[k, 2]
         
-    return assym
+        # Определяем коэффициенты линии
+        ps0 = ps[k, 0]
+        ps1 = ps[k, 1]
+        
+        sign = 1.0
+        if not orthog:
+            sign = 1.0 if ps1 > 0 else -1.0
+            
+        sum_zz = 0.0
+        sum_not_zz = 0.0
+        total_img_sum = 0.0
+        
+        for i in range(30):
+            y_val = grid_coords[i]
+            for j in range(30):
+                x_val = grid_coords[j]
+                
+                # Вычисляем line_func на лету
+                if orthog:
+                    val = (x_val - p0) / (ps0 / ps1) + p1
+                else:
+                    val = -(x_val - p0) / (ps1 / ps0) + p1
+                
+                # Условие маски zz
+                is_zz = (y_val - val) * sign >= 0
+                
+                pixel_val = imgs[k, i, j]
+                total_img_sum += pixel_val
+                if is_zz:
+                    sum_zz += pixel_val
+                else:
+                    sum_not_zz += pixel_val
+                    
+        assym_res[k] = (sum_zz - sum_not_zz) / (total_img_sum + 1e-10)
+        
+    return assym_res
 
+@njit
 def zz_to_line(zz):
-    res = (
-        np.concatenate([np.abs(np.diff(zz, axis=2)), np.zeros((len(zz), 30, 1))], axis=2) + 
-        np.concatenate([np.abs(np.diff(zz, axis=1)), np.zeros((len(zz), 1, 30))], axis=1)
-    )
-    return np.clip(res, 0, 1)
+    n, h, w = zz.shape
+    res = np.zeros((n, h, w))
+    for k in range(n):
+        for i in range(h):
+            for j in range(w):
+                diff_h = 0.0
+                diff_w = 0.0
+                if j < w - 1:
+                    diff_w = abs(zz[k, i, j+1] - zz[k, i, j])
+                if i < h - 1:
+                    diff_h = abs(zz[k, i+1, j] - zz[k, i, j])
+                
+                val = diff_h + diff_w
+                if val > 1.0:
+                    res[k, i, j] = 1.0
+                else:
+                    res[k, i, j] = val
+    return res
 
+@njit
 def get_shower_width(data, ps, points, orthog=False):
-    res = []
-    spreads = []
+    n_imgs = data.shape[0]
+    sigmas = np.zeros(n_imgs)
+    zoff = 25.0
+    grid_coords = np.linspace(-14.5, 14.5, 30)
     
-    assym_res = []
-    zoff = 25
-    
-    x = np.linspace(-14.5, 14.5, 30)
-    y = np.linspace(-14.5, 14.5, 30)
-    xx, yy = np.meshgrid(x, y)
-    xx = np.repeat(xx[np.newaxis, ...], len(data), axis=0)
-    yy = np.repeat(yy[np.newaxis, ...], len(data), axis=0)
-    
-    points_0 = points[:, 0] + zoff * ps[:, 0] / ps[:, 2]
-    points_1 = points[:, 1] + zoff * ps[:, 1] / ps[:, 2]
-    
-    if orthog:
-        line_func = lambda x: -(x - points_0[..., np.newaxis, np.newaxis]) / (ps[:, 0] / ps[:, 1])[..., np.newaxis, np.newaxis] + points_1[..., np.newaxis, np.newaxis]
-    else:
-        line_func = lambda x: (x - points_0[..., np.newaxis, np.newaxis]) / (ps[:, 1] / ps[:, 0])[..., np.newaxis, np.newaxis] + points_1[..., np.newaxis, np.newaxis]
-    rescale = np.sqrt(1 + (ps[:, 1] / ps[:, 0])**2)
-    
-
-    sign = np.ones(len(ps))
-    if not orthog:
-        sign = (ps[:, 1] < 0).astype(int)
-        sign = 2 * (sign - 0.5)
-    
-    idx = np.where((yy - line_func(xx)) * sign[..., np.newaxis, np.newaxis] < 0)        
-    zz = np.ones((len(data), 30, 30))
-    zz[idx] = 0
-    line = zz_to_line(zz)
-    
-    ww = (line * data) # * rescale[..., np.newaxis, np.newaxis]
-    sum_0 = ww.sum(axis=(1, 2))
-    sum_1 = (ww * rescale[..., np.newaxis, np.newaxis] * xx).sum(axis=(1, 2))
-    sum_2 = (ww * (rescale[..., np.newaxis, np.newaxis] * xx)**2).sum(axis=(1, 2))
-    
-    sum_1 = sum_1 / (sum_0 + 1e-5)
-    sum_2 = sum_2 / (sum_0 + 1e-5)
-
-    sigma = np.sqrt(sum_2 - sum_1 * sum_1)
+    for k in range(n_imgs):
+        p0 = points[k, 0] + zoff * ps[k, 0] / ps[k, 2]
+        p1 = points[k, 1] + zoff * ps[k, 1] / ps[k, 2]
+        ps0, ps1 = ps[k, 0], ps[k, 1]
         
-    return np.nan_to_num(sigma)
+        rescale = np.sqrt(1 + (ps1 / ps0)**2)
+        sign = 1.0
+        if not orthog:
+            sign = -1.0 if ps1 < 0 else 1.0
 
+        # Сначала генерируем маску zz для текущего изображения
+        zz_current = np.ones((30, 30))
+        for i in range(30):
+            y_val = grid_coords[i]
+            for j in range(30):
+                if orthog:
+                    val = -(grid_coords[j] - p0) / (ps0 / ps1) + p1
+                else:
+                    val = (grid_coords[j] - p0) / (ps1 / ps0) + p1
+                if (y_val - val) * sign < 0:
+                    zz_current[i, j] = 0
+        
+        # Вычисляем line и моменты
+        sum_0, sum_1, sum_2 = 0.0, 0.0, 0.0
+        for i in range(30):
+            for j in range(30):
+                # Находим line[i, j] аналогично zz_to_line
+                dw = abs(zz_current[i, j+1] - zz_current[i, j]) if j < 29 else 0.0
+                dh = abs(zz_current[i+1, j] - zz_current[i, j]) if i < 29 else 0.0
+                line_val = min(1.0, dw + dh)
+                
+                ww = line_val * data[k, i, j]
+                scaled_x = rescale * grid_coords[j]
+                
+                sum_0 += ww
+                sum_1 += ww * scaled_x
+                sum_2 += ww * (scaled_x**2)
+        
+        s1 = sum_1 / (sum_0 + 1e-5)
+        s2 = sum_2 / (sum_0 + 1e-5)
+        var = s2 - s1 * s1
+        sigmas[k] = np.sqrt(max(0, var)) # max(0, var) для стабильности
+        
+    return sigmas
 
+@njit
 def get_ms_ratio2(data, alpha=0.1):
-    ms = np.sum(data, axis=(1, 2))
-    num = np.sum((data >= (ms * alpha)[:, np.newaxis, np.newaxis]), axis=(1, 2))
-    return num / 900.
+    n_imgs = data.shape[0]
+    res = np.zeros(n_imgs)
+    # Сумма по осям (1, 2)
+    for k in range(n_imgs):
+        ms = 0.0
+        for i in range(30):
+            for j in range(30):
+                ms += data[k, i, j]
+        
+        threshold = ms * alpha
+        count = 0
+        for i in range(30):
+            for j in range(30):
+                if data[k, i, j] >= threshold:
+                    count += 1
+        res[k] = count / 900.0
+    return res
 
+@njit
 def get_sparsity_level(data):
     alphas = np.logspace(-5, -1, 20)
-    sparsity = []
-    for alpha in alphas:
-        sparsity.append(get_ms_ratio2(data, alpha))
-    return np.array(sparsity)
+    sparsity = np.zeros((len(alphas), data.shape[0]))
+    for idx in range(len(alphas)):
+        sparsity[idx] = get_ms_ratio2_numba(data, alphas[idx])
+    return sparsity
 
 
 def get_physical_stats(EnergyDeposit, ParticleMomentum, ParticlePoint):
