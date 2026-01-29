@@ -3,7 +3,7 @@ import numpy as np
 from numba import njit
 
 @njit
-def get_assymmetry(imgs, ps, points, orthog=False):
+def get_assymetry(imgs, ps, points, orthog=False):
     n_imgs = imgs.shape[0]
     assym_res = np.zeros(n_imgs)
     zoff = 25.0
