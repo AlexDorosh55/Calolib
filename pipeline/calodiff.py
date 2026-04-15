@@ -915,3 +915,147 @@ def analyze_model_complexity(
         except Exception as e:
              print(f"Ошибка при профилировании генерации данных: {e}")
     return total_gflops_per_batch
+
+def get_teacher_trajectory(
+    teacher_model: torch.nn.Module, 
+    x_curr: torch.Tensor, 
+    t_start: int, 
+    t_end: int, 
+    K_steps: int, 
+    y_cond: torch.Tensor, 
+    noise_scheduler_fn: Callable, 
+    n_inference_steps: int, 
+    device: str
+) -> torch.Tensor:
+    """
+    Прогоняет замороженную модель-учителя на K шагов от t_start до t_end (DDIM).
+    """
+    # Создаем микро-шаги для учителя
+    t_steps = np.linspace(t_start, t_end, K_steps + 1).astype(int)
+    x_gen = x_curr.clone()
+    
+    with torch.no_grad():
+        for i in range(K_steps):
+            t_current = t_steps[i]
+            t_next = t_steps[i+1]
+            
+            t_tensor = torch.full((x_gen.shape[0],), t_current, device=device, dtype=torch.long)
+            model_out = teacher_model(x_gen, t_tensor, y_cond)
+            
+            t_float_curr = torch.full((x_gen.shape[0], 1, 1, 1), t_current, device=device, dtype=torch.float)
+            sigma_t = noise_scheduler_fn(t_float_curr, n_inference_steps)
+            alpha_t = 1.0 - sigma_t
+            
+            t_float_next = torch.full((x_gen.shape[0], 1, 1, 1), t_next, device=device, dtype=torch.float)
+            sigma_next = noise_scheduler_fn(t_float_next, n_inference_steps)
+            alpha_next = 1.0 - sigma_next
+            
+            # Стандартный шаг DDIM
+            eps = (x_gen - alpha_t * model_out) / (sigma_t + 1e-8)
+            x_gen = alpha_next * model_out + sigma_next * eps
+            
+    return x_gen # Это x_{end}, к которому должен прийти студент
+
+
+def train_distillation(
+    teacher_model: torch.nn.Module,
+    student_model: torch.nn.Module,
+    train_loader: DataLoader,
+    n_epochs: int,
+    loss_fn: Callable,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    schedule: List[int], # <--- Тот самый "опорный лист" (например, от get_power_schedule)
+    teacher_steps_per_interval: int = 2, # Сколько шагов делает учитель внутри интервала (1-2 -> 1)
+    noise_scheduler_name: str = "cosine",
+    n_inference_steps: int = 1000,
+    checkpoint_path: str = "./distilled_checkpoints",
+) -> Dict[str, List[float]]:
+    """
+    Функция прогрессивной дистилляции модели по заданному расписанию (опорному листу).
+    """
+    if not os.path.exists(checkpoint_path):
+        os.makedirs(checkpoint_path)
+
+    noise_scheduler_fn = NOISE_SCHEDULERS.get(noise_scheduler_name)
+    if not noise_scheduler_fn:
+        raise ValueError(f"Неизвестный scheduler шума: {noise_scheduler_name}")
+
+    teacher_model.eval() # Учитель заморожен
+    
+    history = {'train_loss': []}
+    best_train_loss = float('inf')
+
+    # Убеждаемся, что расписание отсортировано по убыванию (от T к 0)
+    schedule = sorted(schedule, reverse=True)
+
+    for epoch in range(n_epochs):
+        print(f"--- Distillation Epoch {epoch + 1}/{n_epochs} ---")
+        student_model.train()
+        epoch_train_loss = []
+        
+        for x, y in tqdm(train_loader, desc="Distilling"):
+            x, y = x.to(device), y.to(device)
+            bs = x.shape[0]
+            
+            # 1. Случайно выбираем интервал из нашего опорного листа
+            # idx от 0 до len(schedule) - 2
+            interval_indices = torch.randint(0, len(schedule) - 1, (bs,))
+            
+            t_start_vals = torch.tensor([schedule[i] for i in interval_indices], device=device)
+            t_end_vals = torch.tensor([schedule[i+1] for i in interval_indices], device=device)
+            
+            # Для простоты батчевых вычислений, возьмем один интервал на весь батч
+            # (если нужна побатчевая рандомизация t, потребуется чуть более сложный сбор t_steps)
+            t_start = t_start_vals[0].item()
+            t_end = t_end_vals[0].item()
+
+            # 2. Зашумляем реальные данные до t_start
+            t_start_float = torch.full((bs, 1, 1, 1), t_start, device=device, dtype=torch.float)
+            sigma_start = noise_scheduler_fn(t_start_float, n_inference_steps)
+            alpha_start = 1.0 - sigma_start
+            
+            noise = torch.randn_like(x)
+            x_start = x * alpha_start + noise * sigma_start
+            
+            # 3. Учитель делает K шагов, чтобы получить x_{end}
+            x_end_target = get_teacher_trajectory(
+                teacher_model, x_start, t_start, t_end, 
+                teacher_steps_per_interval, y, 
+                noise_scheduler_fn, n_inference_steps, device
+            )
+            
+            # 4. Вычисляем идеальный target_x0 для Студента
+            t_end_float = torch.full((bs, 1, 1, 1), t_end, device=device, dtype=torch.float)
+            sigma_end = noise_scheduler_fn(t_end_float, n_inference_steps)
+            alpha_end = 1.0 - sigma_end
+            
+            c = sigma_end / (sigma_start + 1e-8)
+            numerator = x_end_target - c * x_start
+            denominator = alpha_end - c * alpha_start + 1e-8
+            target_x0 = numerator / denominator
+            
+            # 5. Обучаем Студента предсказывать этот target_x0
+            t_tensor_student = torch.full((bs,), t_start, device=device, dtype=torch.long)
+            student_pred = student_model(x_start, t_tensor_student, y)
+            
+            # Используем твой лосс (обычно MSE или Huber)
+            loss = loss_fn(target_x0, student_pred)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_train_loss.append(loss.item())
+
+        avg_train_loss = sum(epoch_train_loss) / len(epoch_train_loss)
+        history['train_loss'].append(avg_train_loss)
+        print(f"Avg Distillation Loss: {avg_train_loss:.5f}")
+        
+        if avg_train_loss < best_train_loss:
+            best_train_loss = avg_train_loss
+            torch.save(student_model.state_dict(), os.path.join(checkpoint_path, "best_distilled_model.pth"))
+            print(f"🚀 New best distilled model saved!")
+
+    print("Distillation finished.")
+    return history
