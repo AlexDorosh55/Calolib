@@ -4,58 +4,57 @@
 ![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-orange.svg)
 ![Kaggle](https://img.shields.io/badge/Kaggle-Training_&_Inference-blue)
 
-**Calolib** — это библиотека и исследовательский фреймворк, представляющий собой продолжение работ по проекту **CaloGAN**. Проект направлен на генеративное моделирование (симуляцию) дождя частиц в калориметрах Большого адронного коллайдера (БАК) с использованием современных диффузионных моделей. 
+**Calolib** is a library and research framework that serves as a continuation of the **CaloGAN** project. It is dedicated to the generative modeling (simulation) of particle showers in the Large Hadron Collider (LHC) calorimeters using state-of-the-art diffusion models.
 
-Данный репозиторий содержит ключевые практические материалы и исходный код, подготовленные в рамках магистерской диссертации.
-
----
-
-## 📑 Содержание
-1. [О фреймворке](#-о-фреймворке-calolib)
-2. [Оценка и валидация](#-оценка-и-валидация-моделей)
-3. [Обучение и инференс](#-обучение-и-инференс)
-4. [Структура репозитория](#-структура-репозитория)
+This repository contains the key practical materials and source code developed as part of a Master's thesis.
 
 ---
 
-## 🛠 О фреймворке Calolib
-
-Основная кодовая база фреймворка сосредоточена в директориях пайплайна и содержит все необходимые инструменты для работы с диффузионными моделями:
-
-*   **`pipeline/calodiff.py`** — ядро библиотеки. Содержит реализацию диффузионной модели и передовых методов её ускорения для быстрого сэмплирования:
-    *   Дистилляция моделей (Distillation)
-    *   Оптимизированные солверы (Solvers)
-    *   Механизмы кэширования (Caching)
-*   **`pipeline/physical_metrics/`** — модуль с реализацией специализированных физических метрик для оценки качества сгенерированных ливней частиц.
-*   **`vizualization_aux/`** — набор вспомогательных методов и утилит для наглядной визуализации результатов генерации и физических распределений.
+## 📑 Table of Contents
+1. [About the Calolib Framework](#-about-the-calolib-framework)
+2. [Evaluation and Validation](#-evaluation-and-validation)
+3. [Training and Inference](#-training-and-inference)
 
 ---
 
-## 📊 Оценка и валидация моделей
+## 🛠 About the Calolib Framework
 
-В репозитории представлены Jupyter-ноутбуки с подробным анализом, тестированием метрик и статистическим обоснованием результатов:
+The core codebase of the framework is located in the pipeline directories and contains all the necessary tools for working with diffusion models:
 
-| Ноутбук | Описание |
+* **`pipeline/calodiff.py`** — The core of the library. It contains the implementation of the diffusion model and advanced methods for its acceleration (fast sampling):
+    * Model Distillation
+    * Optimized Solvers
+    * Caching Mechanisms
+* **`pipeline/physical_metrics/`** — A module containing the implementation of specialized physical metrics to evaluate the quality of the generated particle showers.
+* **`vizualization_aux/`** — A set of auxiliary methods and utilities for clear visualization of generation results and physical distributions.
+
+---
+
+## 📊 Evaluation and Validation
+
+The repository includes Jupyter notebooks with detailed analysis, metric testing, and statistical justification of the results:
+
+| Notebook | Description |
 | :--- | :--- |
-| 📓 `Validating Models With Different Complexity.ipynb` | Проверка и сравнение моделей различной архитектурной сложности. |
-| 📓 `Evaluating models with different complexity and symmetry schedule for caching.ipynb` | Тестирование моделей разной сложности при использовании оптимизированного (симметричного) расписания шагов диффузии для кэширования. |
-| 📓 `MathStat Validating result.ipynb` | Строгое математико-статистическое обоснование стабильности и качества работы самой простой (облегченной) модели относительно базовой (baseline). |
+| 📓 `Validating Models With Different Complexity.ipynb` | Verification and comparison of models with varying architectural complexity. |
+| 📓 `Evaluating models with different complexity and symmetry schedule for caching.ipynb` | Testing models of varying complexity using an optimized (symmetric) schedule of diffusion steps for caching. |
+| 📓 `MathStat Validating result.ipynb` | Rigorous mathematical and statistical justification of the stability and performance of the simplest (lightweight) model relative to the baseline. |
 
 ---
 
-## 🚀 Обучение и инференс
+## 🚀 Training and Inference
 
-Ввиду высоких требований к вычислительным ресурсам, обучение и инференс тяжелых моделей проводились в облачной среде Kaggle. Код и история запусков доступны по следующим ссылкам:
+Due to high computational requirements, the training and inference of heavy models were conducted in the Kaggle cloud environment. The code and run history are available at the following links:
 
-### 🏋️‍♂️ Обучение (Training)
-*   **Ссылка:** [alex55555/calodiff-training](https://www.kaggle.com/code/alex55555/calodiff-training)
-*   **Архитектура UNet:** Версии `3`, `12-15`
-*   **Архитектура DiT (Diffusion Transformer):** Версии `8-11`
+### 🏋️‍♂️ Training
+* **Link:** [alex55555/calodiff-training](https://www.kaggle.com/code/alex55555/calodiff-training)
+* **UNet Architecture:** Versions `3`, `12-15`
+* **DiT (Diffusion Transformer) Architecture:** Versions `8-11`
 
-### 🧠 Инференс (Inference)
-*   **Ссылка:** [alex55555/calodiff-inference](https://www.kaggle.com/code/alex55555/calodiff-inference)
-*   **Описание:** Ноутбук, использовавшийся для генерации выборок тяжелыми моделями и замера скорости/качества сэмплирования.
+### 🧠 Inference
+* **Link:** [alex55555/calodiff-inference](https://www.kaggle.com/code/alex55555/calodiff-inference)
+* **Description:** The notebook used for generating samples with heavy models and measuring sampling speed and quality.
 
 ---
 
-> **Примечание:** Данный репозиторий является частью научно-исследовательской работы. Если у вас возникли вопросы по реализации или физическим метрикам, создавайте *Issue* в этом репозитории.
+> **Note:** This repository is part of a master's research project. If you have any questions regarding the implementation or physical metrics, please feel free to open an *Issue* in this repository.
